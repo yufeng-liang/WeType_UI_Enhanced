@@ -57,6 +57,7 @@ kotlin {
 
 dependencies {
     testImplementation("junit:junit:4.13.2")
+    // 上游 HostPreferencesFileTest 在 JVM 单测需要 XmlPullParser 实现
     testImplementation("net.sf.kxml:kxml2:2.3.0")
     compileOnly("io.github.libxposed:api:102.0.0")
     implementation("io.github.libxposed:service:102.0.0")

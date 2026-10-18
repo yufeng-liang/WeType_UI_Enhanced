@@ -344,13 +344,21 @@ fun Method.hookReplace(callback: (MethodHookParam) -> Any?) {
             thisObject = chain.thisObject,
             originalArgs = chain.args
         )
-        runCatching { callback(param) }.getOrElse { throwable ->
-            Log.e(throwable)
-            val changedArgs = param.changedArgs
-            if (changedArgs == null) chain.proceed() else chain.proceed(changedArgs)
-        }
+        val outcome = runCatching { callback(param) }
+        val failure = outcome.exceptionOrNull()
+        if (failure != null) Log.e(failure)
+        val result = if (failure != null) ProceedWithOriginal else outcome.getOrNull()
+        if (result !== ProceedWithOriginal) return@registerHook result
+        val changedArgs = param.changedArgs
+        if (changedArgs == null) chain.proceed() else chain.proceed(changedArgs)
     }
 }
+
+/**
+ * [hookReplace] 回调返回此哨兵表示放行原方法。不能用 null 代替：原生方法返回 int/long 时
+ * 回传 null 会在拆箱处崩溃，返回对象的方法也可能合法地返回 null。
+ */
+object ProceedWithOriginal
 
 fun Method.hookReturnConstant(result: Any?) {
     val method = this

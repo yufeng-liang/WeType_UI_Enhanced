@@ -410,7 +410,7 @@ internal fun WeTypeSettingsApp(
 }
 
 @Composable
-private fun SyncSystemBars(darkMode: Boolean) {
+internal fun SyncSystemBars(darkMode: Boolean) {
     val view = LocalView.current
     if (view.isInEditMode) return
 
@@ -527,6 +527,30 @@ private fun WeTypeSettingsScreen(
     var disableHotUpdate by rememberSaveable {
         mutableStateOf(snapshot.disableHotUpdate)
     }
+    var showCrossDeviceClipboard by rememberSaveable {
+        mutableStateOf(snapshot.showCrossDeviceClipboard)
+    }
+    var removeClipboardRetentionLimit by rememberSaveable {
+        mutableStateOf(snapshot.removeClipboardRetentionLimit)
+    }
+    var removeClipboardTextLimit by rememberSaveable {
+        mutableStateOf(snapshot.removeClipboardTextLimit)
+    }
+    var clipboardImageAdjustRatio by rememberSaveable {
+        mutableStateOf(snapshot.clipboardImageAdjustRatio)
+    }
+    var clipboardImageCrop by rememberSaveable {
+        mutableStateOf(snapshot.clipboardImageCrop)
+    }
+    var clipboardImageUniformRowHeight by rememberSaveable {
+        mutableStateOf(snapshot.clipboardImageUniformRowHeight)
+    }
+    var clipboardImageMaxCount by rememberSaveable {
+        mutableIntStateOf(snapshot.clipboardImageMaxCount)
+    }
+    var clipboardImageMaxSizeMb by rememberSaveable {
+        mutableIntStateOf(snapshot.clipboardImageMaxSizeMb)
+    }
     val appearanceGroupColors = rememberSaveable(
         saver = listSaver(
             save = { it.toList() },
@@ -608,6 +632,14 @@ private fun WeTypeSettingsScreen(
             disableHotUpdate = disableHotUpdate,
             hyperMaterialEnabled = hyperMaterialEnabled,
             glassOverrides = glassOverridesToSave,
+            showCrossDeviceClipboard = showCrossDeviceClipboard,
+            removeClipboardRetentionLimit = removeClipboardRetentionLimit,
+            removeClipboardTextLimit = removeClipboardTextLimit,
+            clipboardImageAdjustRatio = clipboardImageAdjustRatio,
+            clipboardImageCrop = clipboardImageCrop,
+            clipboardImageUniformRowHeight = clipboardImageUniformRowHeight,
+            clipboardImageMaxCount = clipboardImageMaxCount,
+            clipboardImageMaxSizeMb = clipboardImageMaxSizeMb,
             onPersisted = { saved ->
                 Toast.makeText(
                     context,
@@ -1028,6 +1060,35 @@ private fun WeTypeSettingsScreen(
                     }
                 }
             }
+
+            // 剪贴板增强分组
+            ClipboardSubPageContent(
+                showCrossDeviceClipboard = showCrossDeviceClipboard,
+                onShowCrossDeviceClipboardChange = { showCrossDeviceClipboard = it },
+                removeClipboardRetentionLimit = removeClipboardRetentionLimit,
+                onRemoveClipboardRetentionLimitChange = { removeClipboardRetentionLimit = it },
+                removeClipboardTextLimit = removeClipboardTextLimit,
+                onRemoveClipboardTextLimitChange = { removeClipboardTextLimit = it },
+                clipboardImageAdjustRatio = clipboardImageAdjustRatio,
+                onClipboardImageAdjustRatioChange = { clipboardImageAdjustRatio = it },
+                clipboardImageCrop = clipboardImageCrop,
+                onClipboardImageCropChange = { clipboardImageCrop = it },
+                clipboardImageUniformRowHeight = clipboardImageUniformRowHeight,
+                onClipboardImageUniformRowHeightChange = { clipboardImageUniformRowHeight = it },
+                clipboardImageMaxCount = clipboardImageMaxCount,
+                onClipboardImageMaxCountChange = { clipboardImageMaxCount = it },
+                clipboardImageMaxSizeMb = clipboardImageMaxSizeMb,
+                onClipboardImageMaxSizeMbChange = { clipboardImageMaxSizeMb = it },
+                onOpenClipboardBackup = {
+                    if (!WeTypeHostLauncher.launchBackupPage(hostActivity)) {
+                        Toast.makeText(
+                            context,
+                            R.string.settings_clipboard_backup_unavailable,
+                            Toast.LENGTH_SHORT
+                        ).show()
+                    }
+                }
+            )
 
             // 操作分组
             item {

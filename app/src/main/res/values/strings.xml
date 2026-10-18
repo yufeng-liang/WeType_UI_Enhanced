@@ -92,6 +92,7 @@
     <string name="settings_save_desc">Write the current configuration to the module</string>
     <string name="settings_reset_title">Restore defaults</string>
     <string name="settings_reset_desc">Reset all options to their default values</string>
+    <string name="settings_clipboard_backup_unavailable">Could not open the clipboard backup page</string>
     <string name="settings_restart_title">Restart WeType</string>
     <string name="settings_restart_desc">Restart the input method to apply changes</string>
     <string name="settings_visit_github_title">Visit GitHub</string>
