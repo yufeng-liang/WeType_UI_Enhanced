@@ -117,7 +117,9 @@ internal object WeTypeWindowHooks {
         var hardwareViewIds: IntArray? = null,
         var originalWindowStateCaptured: Boolean = false,
         var originalWindowBackground: Drawable? = null,
-        var originalWindowBlurRadius: Int? = null
+        var originalWindowBlurRadius: Int? = null,
+        // 图片预览页盖住键盘时，把键盘背景延伸到窗口底部，遮住预览页下方的空白。
+        var previewActive: Boolean = false
     )
 
     private class BackgroundTextureWaiter(
@@ -176,6 +178,22 @@ internal object WeTypeWindowHooks {
     fun reconcileCurrentOverlayUnderlays(rootViews: List<View>) {
         WeTypeOverlayCompositor.reconcile(rootViews)
         WeTypeFloatingBackgrounds.reconcile(rootViews)
+    }
+
+    /**
+     * 图片预览页（S33）盖住键盘时：
+     * - 预览页保持宿主原生透明，直接露出键盘 carrier（同一套液态玻璃/高级材质）；
+     * - 键盘 carrier 的下边界临时延伸到窗口底部，让预览页底部融入屏幕底边。
+     */
+    internal fun setPreviewActive(decor: View, active: Boolean) {
+        val state = synchronized(weTypeWindowStates) {
+            weTypeWindowStates.values.firstOrNull { it.backgroundDecorView?.get() === decor }
+        } ?: return
+        if (state.previewActive == active) return
+        state.previewActive = active
+        state.backgroundStyleDirty = true
+        state.backgroundUpdatePending = true
+        decor.invalidate()
     }
 
     fun hookWindowBlur() {
@@ -626,7 +644,13 @@ internal object WeTypeWindowHooks {
         bounds: WeTypeBackgroundBounds
     ) {
         val decorGroup = decorView as? ViewGroup ?: return
-        val backgroundHeight = bounds.height
+        // 预览页本身比键盘矮，窗口底部会空出一条。把 carrier 临时延伸到
+        // decor 底部，让预览页下沿和键盘页一样贴到屏幕底边。
+        val backgroundHeight = if (state.previewActive) {
+            (decorView.height - bounds.top).coerceAtLeast(bounds.height)
+        } else {
+            bounds.height
+        }
         val settings = WeTypeSettings.readSnapshotXposed()
         val cornerRadii = resolveCornerRadii(decorView, context, state, settings.cornerRadius)
         if (backgroundHeight < cornerRadii.maxRadius()) {
