@@ -20,6 +20,7 @@ import com.xposed.wetypehook.wetype.host.WeTypeHostContracts
 import com.xposed.wetypehook.wetype.host.pickHostMethod
 import com.xposed.wetypehook.wetype.settings.WeTypeSettings
 import com.xposed.wetypehook.xposed.hookAfter
+import java.lang.reflect.Field
 import java.lang.reflect.Method
 import java.util.Collections
 import java.util.WeakHashMap
@@ -114,6 +115,30 @@ internal object WeTypeClipboardSearchFilter {
     private var getTypeMethod: Method? = null
     @Volatile
     private var getContentMethod: Method? = null
+
+    // ---- 反射缓存（owner 类失配才重扫，仿 getTypeMethod 的模式） ----
+    // onBindViewHolder 每行绑定都会取 holder 的 itemView：declaredFields 双层遍历不能进热路径。
+    // 按 holder 具体类缓存 View 类型字段列表，空列表（= 没找到，null 也缓存）不再重扫。
+    @Volatile
+    private var holderViewFields: List<Field>? = null
+    @Volatile
+    private var holderViewFieldsOwner: Class<*>? = null
+
+    // setList / getListAdapter / notifyDataSetChanged 的方法缓存：调用点受 300ms 防抖保护（优先级低），
+    // 但同名宿主类每次过滤都会重扫 declaredMethods 刷日志，顺手按 owner 类缓存；owner 已记录而
+    // Method 为空 = 已确认不存在，不再重扫。
+    @Volatile
+    private var setListMethod: Method? = null
+    @Volatile
+    private var setListMethodOwner: Class<*>? = null
+    @Volatile
+    private var getListAdapterMethod: Method? = null
+    @Volatile
+    private var getListAdapterMethodOwner: Class<*>? = null
+    @Volatile
+    private var notifyDataSetChangeMethod: Method? = null
+    @Volatile
+    private var notifyDataSetChangeMethodOwner: Class<*>? = null
 
     private val debounceTask = Runnable {
         try {
@@ -357,15 +382,22 @@ internal object WeTypeClipboardSearchFilter {
 
     private fun invokeSetList(scrollView: Any, filtered: List<Any>) {
         try {
-            val method = scrollView.javaClass.declaredMethods.firstOrNull { m ->
-                m.name == "setList" &&
-                    m.parameterTypes.size == 1 &&
-                    List::class.java.isAssignableFrom(m.parameterTypes[0])
-            } ?: run {
-                AndroidLog.e(TAG, "setList(List) not found on ${scrollView.javaClass.name}")
+            // setList 反射结果按宿主类缓存：owner 相同直接复用（owner 已记录而方法为空 = 已确认无）。
+            val scrollViewClass = scrollView.javaClass
+            if (setListMethodOwner != scrollViewClass) {
+                setListMethod = scrollViewClass.declaredMethods.firstOrNull { m ->
+                    m.name == "setList" &&
+                        m.parameterTypes.size == 1 &&
+                        List::class.java.isAssignableFrom(m.parameterTypes[0])
+                }
+                setListMethodOwner = scrollViewClass
+                setListMethod?.isAccessible = true
+            }
+            val method = setListMethod ?: run {
+                // 仅在首次确认不存在时记日志，避免每次过滤重扫 + 刷屏。
+                AndroidLog.e(TAG, "setList(List) not found on ${scrollViewClass.name}")
                 return
             }
-            method.isAccessible = true
             // 原生 setList 期望 ArrayList<C>；传 ArrayList 保持与原生一致。
             method.invoke(scrollView, ArrayList(filtered))
         } catch (t: Throwable) {
@@ -393,32 +425,52 @@ internal object WeTypeClipboardSearchFilter {
     private fun invokeAdapterFullRebind(scrollView: Any) {
         try {
             val adapter = resolveAdapter(scrollView) ?: return
-            var clazz: Class<*>? = adapter.javaClass
-            while (clazz != null && clazz != Any::class.java) {
-                for (method in clazz.declaredMethods) {
-                    if (method.name == "notifyDataSetChanged" && method.parameterTypes.isEmpty()) {
-                        method.isAccessible = true
-                        method.invoke(adapter)
-                        return
+            // notifyDataSetChanged 可能声明在父类上：按 adapter 具体类（owner）缓存查找结果，
+            // owner 相同直接复用（owner 已记录而方法为空 = 已确认无）。
+            val adapterClass = adapter.javaClass
+            if (notifyDataSetChangeMethodOwner != adapterClass) {
+                var found: Method? = null
+                var clazz: Class<*>? = adapterClass
+                while (clazz != null && clazz != Any::class.java && found == null) {
+                    for (method in clazz.declaredMethods) {
+                        if (method.name == "notifyDataSetChanged" && method.parameterTypes.isEmpty()) {
+                            found = method
+                            break
+                        }
                     }
+                    clazz = clazz.superclass
                 }
-                clazz = clazz.superclass
+                notifyDataSetChangeMethod = found
+                notifyDataSetChangeMethodOwner = adapterClass
+                found?.isAccessible = true
             }
-            AndroidLog.e(TAG, "notifyDataSetChanged not found on ${adapter.javaClass.name}")
+            val method = notifyDataSetChangeMethod ?: run {
+                // 仅在首次确认不存在时记日志，避免每次过滤重扫 + 刷屏。
+                AndroidLog.e(TAG, "notifyDataSetChanged not found on ${adapterClass.name}")
+                return
+            }
+            method.invoke(adapter)
         } catch (t: Throwable) {
             AndroidLog.e(TAG, "adapter full rebind failed: ${t.message}")
         }
     }
 
     private fun resolveAdapter(scrollView: Any): Any? = try {
-        val getter = scrollView.javaClass.declaredMethods.firstOrNull { m ->
-            m.name == "getListAdapter" && m.parameterTypes.isEmpty()
+        // getListAdapter 反射结果按宿主类缓存：owner 相同直接复用（owner 已记录而方法为空 = 已确认无）。
+        val scrollViewClass = scrollView.javaClass
+        if (getListAdapterMethodOwner != scrollViewClass) {
+            getListAdapterMethod = scrollViewClass.declaredMethods.firstOrNull { m ->
+                m.name == "getListAdapter" && m.parameterTypes.isEmpty()
+            }
+            getListAdapterMethodOwner = scrollViewClass
+            getListAdapterMethod?.isAccessible = true
         }
+        val getter = getListAdapterMethod
         if (getter == null) {
+            // 仅在首次确认不存在时记日志，避免每次过滤重扫 + 刷屏。
             AndroidLog.e(TAG, "getListAdapter() not found")
             null
         } else {
-            getter.isAccessible = true
             getter.invoke(scrollView) ?: run {
                 AndroidLog.e(TAG, "getListAdapter() returned null")
                 null
@@ -499,24 +551,48 @@ internal object WeTypeClipboardSearchFilter {
 
     private fun getHolderItemView(holder: Any): View? {
         try {
-            var clazz: Class<*>? = holder.javaClass
-            while (clazz != null && clazz != Any::class.java) {
-                for (field in clazz.declaredFields) {
-                    try {
-                        if (!View::class.java.isAssignableFrom(field.type)) continue
-                        field.isAccessible = true
-                        val view = field.get(holder) as? View
-                        if (view != null) return view
-                    } catch (_: Throwable) {
-                        continue
-                    }
+            // 热路径（每行绑定一次）：优先读缓存字段列表；owner 失配才沿父类链重扫一次。
+            val holderClass = holder.javaClass
+            if (holderViewFieldsOwner != holderClass) {
+                holderViewFields = collectHolderViewFields(holderClass)
+                holderViewFieldsOwner = holderClass
+            }
+            val fields = holderViewFields ?: return null
+            for (field in fields) {
+                try {
+                    // 声明顺序与原「逐层扫描取第一个非 null View」一致，取第一个有值的。
+                    val view = field.get(holder) as? View ?: continue
+                    return view
+                } catch (_: Throwable) {
+                    continue
                 }
-                clazz = clazz.superclass
             }
         } catch (t: Throwable) {
             AndroidLog.e(TAG, "get holder itemView failed: ${t.message}")
         }
         return null
+    }
+
+    /**
+     * 沿父类链（到 Object 为止）收集 View 类型的 declared 字段，供 [getHolderItemView] 按
+     * holder 类缓存。空列表表示该类没有 View 字段——同样缓存（null 也缓存），不再重扫。
+     */
+    private fun collectHolderViewFields(holderClass: Class<*>): List<Field> {
+        val out = ArrayList<Field>(4)
+        var clazz: Class<*>? = holderClass
+        while (clazz != null && clazz != Any::class.java) {
+            for (field in clazz.declaredFields) {
+                try {
+                    if (!View::class.java.isAssignableFrom(field.type)) continue
+                    field.isAccessible = true
+                    out.add(field)
+                } catch (_: Throwable) {
+                    // isAccessible 失败的字段跳过，与原逻辑容错一致。
+                }
+            }
+            clazz = clazz.superclass
+        }
+        return out
     }
 
     private fun forEachTextView(view: View, keyword: String) {
@@ -544,6 +620,8 @@ internal object WeTypeClipboardSearchFilter {
             // 上一轮可能把正文换成了「命中片段」，先还原成完整原文再重算。
             restoreSnippet(tv)
             pendingSnippets.remove(tv)
+            // 重绑作废旧片段：顺手摘掉排版监听，命中不可见时下方 schedule 会重新挂上。
+            unwatchSnippet(tv)
             // 先清除上一轮同色高亮，恢复原样后再按当前关键词重打。
             clearOurSpans(tv)
             if (keyword.isEmpty()) return
@@ -636,6 +714,22 @@ internal object WeTypeClipboardSearchFilter {
     }
 
     /**
+     * 片段流程终结时摘掉排版监听：listener 挂上后从不 remove 的话，View 存活期间每次布局
+     * 都会回调一次 evaluateSnippet（空跑早退）。所有「这条正文不再有待办片段」的收口点都要调用；
+     * 摘掉后如果再次命中不可见，[scheduleSnippetIfMatchOffscreen] 会经 [snippetWatched] 重新挂上。
+     */
+    private fun unwatchSnippet(tv: TextView) {
+        try {
+            // 只有确实挂着的才 remove，避免对未监听的 View 空操作。
+            if (snippetWatched.remove(tv)) {
+                tv.removeOnLayoutChangeListener(snippetLayoutListener)
+            }
+        } catch (t: Throwable) {
+            AndroidLog.e(TAG, "unwatch snippet failed: ${t.message}")
+        }
+    }
+
+    /**
      * 命中落在卡片可见行之外时，把正文换成「命中附近的片段」，前面加省略号。
      *
      * 瀑布流会把正文按「卡片最大高度」压成几行（`maxLines` + `ellipsize`），而搜索是按**整条内容**
@@ -670,6 +764,7 @@ internal object WeTypeClipboardSearchFilter {
             // 这一帧已经被重绑/改写，不是我们写进去的那份文本就作废。
             if (!TextUtils.equals(tv.text, applied ?: pending.original)) {
                 pendingSnippets.remove(tv)
+                unwatchSnippet(tv) // 作废即终结：摘掉排版监听，别让它空跑到 View 回收。
                 return
             }
             val layout = tv.layout
@@ -680,6 +775,7 @@ internal object WeTypeClipboardSearchFilter {
             if (applied != null) {
                 // 片段自己的排版出来了：命中还被截掉（片段里的字比原文宽）就退回紧凑片段，只验证这一次。
                 pendingSnippets.remove(tv)
+                unwatchSnippet(tv) // 片段验证流程终结，摘掉排版监听（下方续轮如需要会重新挂上）。
                 if (ClipboardSnippetLogic.isMatchHidden(pending.appliedMatchEnd, visibleEnd)) {
                     // 片段里的字比原文宽，窗口取大了：按这次量到的可见字数收窄再来，别一下子退成只剩一行。
                     if (pending.round < SNIPPET_MAX_ROUNDS) {
@@ -740,6 +836,7 @@ internal object WeTypeClipboardSearchFilter {
         if (start <= 0) start = compactStart
         if (start <= 0) {
             pendingSnippets.remove(tv)
+            unwatchSnippet(tv) // 不换片段即终结：摘掉排版监听。
             return
         }
         val endExclusive = minOf(pending.source.length, start + SNIPPET_MAX_CHARS)
@@ -755,11 +852,15 @@ internal object WeTypeClipboardSearchFilter {
         // 紧凑片段本身就保证命中在第一行，不用再验证。
         if (compact) {
             pendingSnippets.remove(tv)
+            unwatchSnippet(tv) // 紧凑片段即终结：摘掉排版监听。
         } else {
             pendingSnippets[tv] = PendingSnippet(
                 pending.original, pending.source, pending.ranges,
                 applied = snippet, appliedMatchEnd = first.last - start + head.length, round = round
             )
+            // 收窄续轮是从 evaluateSnippet 直接调进来的，那里可能刚摘过监听：这里补挂，
+            // 保证片段自己的排版出来后仍能收到布局回调完成验证。
+            if (snippetWatched.add(tv)) tv.addOnLayoutChangeListener(snippetLayoutListener)
         }
         tv.setText(snippet, TextView.BufferType.NORMAL)
     }

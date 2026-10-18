@@ -9,6 +9,10 @@ import java.util.Locale
  * 纯 Kotlin + TinyPinyin，不碰 Xposed/Adapter/View。
  * 上游语义见 S1 证据：文本条目即 `C.getType()==0`，[getContent()][String] 为搜索唯一范围；
  * 主过滤点 `ImeClipboardScrollView.setList`（S4/S5 消费本引擎结果）。
+ *
+ * 已知口径限制（按「召回优先」取舍，暂不修复）：
+ * 1. 全拼串是无分隔拼接：跨音节误命中不可避免，如 `xian` 会同时命中「西安」与「先」。
+ * 2. TinyPinyin 是单音字典：多音字组合可能匹配不到，如 `chongqing` ↔「重庆」（重取 zhòng 音）。
  */
 data class MatchResult(val index: Int, val ranges: List<IntRange>)
 
@@ -50,21 +54,38 @@ object ClipboardSearchEngine {
         //    （实机：搜 `SS` 只有开头那一处变色，用户报「有些没有标红」）。区间互不重叠、按顺序给出。
         //    未命中时不分配任何对象：这条路径在「搜一个不存在的词」时会被 10 万条内容各走一遍。
         val lower = content.lowercase(Locale.ROOT)
-        val first = lower.indexOf(kw)
-        if (first >= 0) {
+        if (lower.length != content.length) {
+            // 保守路径（罕见）：lowercase 副本与原文不等长（如土耳其语 'İ' U+0130 小写成两个字符），
+            // 副本下标无法一一映射回原文，高亮区间会错位；改为对原文逐字符忽略大小写扫描，
+            // 命中区间天然落在原文下标上。此路径性能不敏感（正常中英文内容不会走到）。
             val hits = ArrayList<IntRange>(2)
-            var from = first
-            while (from <= lower.length - kw.length) {
-                val idx = lower.indexOf(kw, from)
-                if (idx < 0) break
-                val end = (idx + kw.length - 1).coerceAtMost(content.length - 1)
-                if (idx < content.length && end >= idx) hits.add(idx..end)
+            var from = 0
+            while (from <= content.length - kw.length) {
+                val idx = indexOfIgnoreCase(content, kw, from) ?: break
+                hits.add(idx until idx + kw.length)
                 from = idx + kw.length
             }
+            // 等长路径语义一致：字面未命中才继续尝试拼音路径。
             if (hits.isNotEmpty()) return hits
-            return null
+        } else {
+            val first = lower.indexOf(kw)
+            if (first >= 0) {
+                val hits = ArrayList<IntRange>(2)
+                var from = first
+                while (from <= lower.length - kw.length) {
+                    val idx = lower.indexOf(kw, from)
+                    if (idx < 0) break
+                    val end = (idx + kw.length - 1).coerceAtMost(content.length - 1)
+                    if (idx < content.length && end >= idx) hits.add(idx..end)
+                    from = idx + kw.length
+                }
+                if (hits.isNotEmpty()) return hits
+                return null
+            }
         }
         // 2. 拼音命中：关键词须为 ASCII 词（拼音/首字母），含汉字则字面已判负，直接返回。
+        //    口径限制：全拼串无分隔拼接，存在跨音节误命中（xian 命中西安/先，召回优先不切音节）；
+        //    TinyPinyin 为单音字典，多音字组合（如 chongqing↔重庆）可能匹配不到。详见类 KDoc。
         if (!isAsciiWord(kw)) return null
         if (!hasChinese(content)) return null
         // 单遍构建全拼串与首字母串（未命中路径不做下标回填分配）。
@@ -106,6 +127,26 @@ object ClipboardSearchEngine {
             return false
         }
         return true
+    }
+
+    /**
+     * 保守路径用的忽略大小写 indexOf：从 [from] 起在原文里逐字符找 kw。
+     * kw 已 normalize（小写），只需把原文侧字符 [lowercaseChar] 后比较；
+     * 返回的即是原文下标，未命中返回 null。
+     */
+    private fun indexOfIgnoreCase(content: String, kw: String, from: Int): Int? {
+        val lastStart = content.length - kw.length
+        var i = from
+        while (i <= lastStart) {
+            var j = 0
+            while (j < kw.length) {
+                if (content[i + j].lowercaseChar() != kw[j]) break
+                j++
+            }
+            if (j == kw.length) return i
+            i++
+        }
+        return null
     }
 
     private fun hasChinese(s: String): Boolean {

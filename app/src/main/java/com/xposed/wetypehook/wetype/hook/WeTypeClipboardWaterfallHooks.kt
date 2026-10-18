@@ -20,6 +20,8 @@ import com.xposed.wetypehook.wetype.host.viewHolderItemViewField
 import com.xposed.wetypehook.wetype.settings.WeTypeSettings
 import com.xposed.wetypehook.xposed.hookAfter
 import com.xposed.wetypehook.xposed.Log as ModuleLog
+import java.lang.ref.WeakReference
+import java.lang.reflect.Field
 import java.lang.reflect.Method
 import java.lang.reflect.Modifier
 import java.util.Collections
@@ -367,10 +369,16 @@ internal object WeTypeClipboardWaterfallHooks {
 
     private fun recalibrateChildren(rv: View) {
         if (rv !is ViewGroup) return
+        // 校准要用的 id 先一次列出：原先这里先 findViewById 卡片做过滤，calibrateItem 内部又要对
+        // 同一棵子树做十几次 findViewById，每轮 onLayout × 每个可见子项都在重复遍历同一棵树。
+        val ids = calibrateViewIds()
         for (i in 0 until rv.childCount) {
             val child = rv.getChildAt(i) ?: continue
-            if (child.width <= 0 || findItemView(child, containerId) == null) continue
-            runCatching { calibrateItem(child, child.width, measured = true) }
+            if (child.width <= 0) continue
+            // 一次 DFS 收齐后传下去复用；映射缺 key 与 findViewById 未命中等价（id=0 也不收）。
+            val views = collectItemViews(child, ids)
+            if (views[containerId] == null) continue
+            runCatching { calibrateItem(child, child.width, measured = true, collected = views) }
                 .onFailure { ModuleLog.e("$TAG: waterfall recalibrate item failed: $it") }
         }
     }
@@ -395,16 +403,20 @@ internal object WeTypeClipboardWaterfallHooks {
     }
 
     private fun enableWaterfall(rv: View) {
-        val state = nativeByRv.getOrPut(rv) {
-            NativeState(
-                layoutManager = currentLayoutManager(rv),
-                itemAnimator = currentItemAnimator(rv),
-                height = rv.layoutParams?.height ?: ViewGroup.LayoutParams.WRAP_CONTENT,
-                paddingLeft = rv.paddingLeft,
-                paddingTop = rv.paddingTop,
-                paddingRight = rv.paddingRight,
-                paddingBottom = rv.paddingBottom
-            )
+        // synchronizedMap 只保证单个操作原子，getOrPut 是「查 + 放」两步复合操作，并发触发时
+        // 会重复建状态；按 synchronizedMap 文档要求，复合操作手动 synchronized 在 map 监视器上。
+        val state = synchronized(nativeByRv) {
+            nativeByRv.getOrPut(rv) {
+                NativeState(
+                    layoutManager = currentLayoutManager(rv),
+                    itemAnimator = currentItemAnimator(rv),
+                    height = rv.layoutParams?.height ?: ViewGroup.LayoutParams.WRAP_CONTENT,
+                    paddingLeft = rv.paddingLeft,
+                    paddingTop = rv.paddingTop,
+                    paddingRight = rv.paddingRight,
+                    paddingBottom = rv.paddingBottom
+                )
+            }
         }
         if (waterfallByRv.contains(rv)) return
         val lm = createStaggeredGridManager(rv) ?: return
@@ -439,7 +451,13 @@ internal object WeTypeClipboardWaterfallHooks {
         // 卡片链被写成了显式 px，关开关后交回 wrap，宿主下次绑定会写回原生宽度。
         val group = rv as? ViewGroup
         if (group != null) {
-            for (i in 0 until group.childCount) resetItemWidths(group.getChildAt(i))
+            for (i in 0 until group.childCount) {
+                val child = group.getChildAt(i) ?: continue
+                // 与 attachCalibration 配对拆除：摘掉校准 listener、清掉弱表记录。listener 挂在
+                // 宿主 View 上永不 remove 的话，关闭瀑布流/热重载后回调仍持着旧引用继续触发。
+                detachCalibration(child)
+                resetItemWidths(child)
+            }
         }
         rv.setPadding(
             state?.paddingLeft ?: 0,
@@ -503,8 +521,19 @@ internal object WeTypeClipboardWaterfallHooks {
      * getter 再用「返回类型与 setter 参数类型相同」配对。**只认形状会认错**：`View.setContentCaptureSession`
      * 的参数类型形状相同，真机上被当成 setter 调了 `setContentCaptureSession(null)`，所以必须叠加嵌套关系。
      */
-    private fun itemAnimatorSetter(rv: View): Method? =
-        rv.javaClass.methods.firstOrNull(::isItemAnimatorSetter)
+    /** ItemAnimator setter 按类缓存：宿主 RecyclerView 的方法表是百级，原先每次应用布局模式
+     *  都线性扫一遍。探测失败（null）也要真正缓存 —— getOrPut 分不清「没缓存」与「缓存了 null」。 */
+    private val itemAnimatorSetterCache: MutableMap<Class<*>, Method?> =
+        Collections.synchronizedMap(WeakHashMap())
+
+    private fun itemAnimatorSetter(rv: View): Method? = synchronized(itemAnimatorSetterCache) {
+        if (itemAnimatorSetterCache.containsKey(rv.javaClass)) {
+            itemAnimatorSetterCache[rv.javaClass]
+        } else {
+            rv.javaClass.methods.firstOrNull(::isItemAnimatorSetter)
+                .also { itemAnimatorSetterCache[rv.javaClass] = it }
+        }
+    }
 
     private fun currentItemAnimator(rv: View): Any? {
         val type = itemAnimatorSetter(rv)?.parameterTypes?.get(0) ?: return null
@@ -804,11 +833,10 @@ internal object WeTypeClipboardWaterfallHooks {
      * 布局完成后量一次：卡片实际高度仍超过上限，就按实测行距少排几行（只减不增）。
      * 每次绑定会重新估算，所以这里不会把行数永久压低。
      */
-    private fun correctTextOverflow(itemView: View) {
+    private fun correctTextOverflow(tv: TextView, card: View) {
+        // 文本与卡片由调用方传入：一次 DFS 的收集结果直接复用，不再重复 findViewById。
         val cap = maxContentHeightPx()
         if (cap <= 0) return
-        val tv = contentTv(itemView) ?: return
-        val card = findItemView(itemView, containerId) ?: return
         val shown = tv.lineCount
         if (tv.layout == null || shown <= 1 || card.height <= cap) return
         val pitch = linePitchPx(tv)
@@ -851,17 +879,17 @@ internal object WeTypeClipboardWaterfallHooks {
     }
 
     /** 卡片上不属于文本行、也不含药丸标签行的固定占位：文本与 `line1` 的上下内边距。 */
-    private fun baseChromePx(itemView: View, tv: TextView): Int {
+    private fun baseChromePx(itemView: View, tv: TextView, views: Map<Int, View>? = null): Int {
         var chrome = tv.paddingTop + tv.paddingBottom
-        findItemView(itemView, WeTypeClipboardImageHost.line1Id)?.let { line1 ->
+        findCollected(views, itemView, WeTypeClipboardImageHost.line1Id)?.let { line1 ->
             chrome += line1.paddingTop + line1.paddingBottom
         }
         return chrome
     }
 
-    private fun textChromePx(itemView: View, tv: TextView): Int {
-        var chrome = baseChromePx(itemView, tv)
-        findItemView(itemView, WeTypeClipboardImageHost.keyInfoId)
+    private fun textChromePx(itemView: View, tv: TextView, views: Map<Int, View>? = null): Int {
+        var chrome = baseChromePx(itemView, tv, views)
+        findCollected(views, itemView, WeTypeClipboardImageHost.keyInfoId)
             ?.takeIf { it.visibility == View.VISIBLE }
             ?.let { keyInfo ->
                 chrome += keyInfo.layoutParams?.height?.takeIf { it > 0 } ?: keyInfo.height
@@ -946,11 +974,13 @@ internal object WeTypeClipboardWaterfallHooks {
         actionMenus[menu] = ActionMenuStructure(column, topRow)
     }
 
-    private fun applyActionMenu(itemView: View, columnWidth: Int) {
+    private fun applyActionMenu(itemView: View, columnWidth: Int, views: Map<Int, View>) {
+        // 调用方（calibrateItem）已一次 DFS 收齐所需 id，这里直接取映射，不再逐个 findViewById；
+        // 映射缺 key 与 findViewById 未命中等价（id=0 也不会收进映射）。
         val ids = actionIds ?: return
-        val menu = findItemView(itemView, ids.containerId) ?: return
+        val menu = views[ids.containerId] ?: return
         val structure = actionMenus[menu] ?: return
-        val card = findItemView(itemView, containerId) ?: return
+        val card = views[containerId] ?: return
         val gap = dpToPx(itemView, ACTION_GAP_DP)
         val buttonWidth = ClipboardWaterfallLayoutLogic.actionButtonPx(
             columnWidthPx = columnWidth,
@@ -960,7 +990,7 @@ internal object WeTypeClipboardWaterfallHooks {
             minButtonPx = dpToPx(itemView, ACTION_BUTTON_MIN_DP),
             maxButtonPx = dpToPx(itemView, ACTION_BUTTON_MAX_DP)
         )
-        val block = actionBlockHeightPx(itemView, card)
+        val block = actionBlockHeightPx(itemView, card, views)
         val (topRow, bottomRow) = ClipboardWaterfallLayoutLogic.actionRowHeightsPx(block, gap)
         if (buttonWidth <= 0 || topRow <= 0 || bottomRow <= 0) return
         val blockWidth = 2 * buttonWidth + gap
@@ -973,15 +1003,15 @@ internal object WeTypeClipboardWaterfallHooks {
         setMarginStart(structure.column, gap)
         styleActionButton(
             itemView, ids.addId, ids.addTextId, ids.addIconId,
-            buttonWidth, topRow, 0, 0, radius, icon
+            buttonWidth, topRow, 0, 0, radius, icon, views
         )
         styleActionButton(
             itemView, ids.bombId, ids.bombTextId, ids.bombIconId,
-            buttonWidth, topRow, gap, 0, radius, icon
+            buttonWidth, topRow, gap, 0, radius, icon, views
         )
         styleActionButton(
             itemView, ids.deleteId, 0, ids.deleteIconId,
-            blockWidth, bottomRow, 0, gap, radius, icon
+            blockWidth, bottomRow, 0, gap, radius, icon, views
         )
         // 本函数是从布局回调里调用的，写 LayoutParams 只会落到**下一次**布局上。更麻烦的是：布局
         // 过程中 `View.setLayoutParams` 触发的 requestLayout 会被 `ViewRootImpl.requestLayoutDuringLayout`
@@ -995,7 +1025,7 @@ internal object WeTypeClipboardWaterfallHooks {
         // 条目跟着变高，卡片下方空出一大块。GONE 的按钮实测高是 0，跳过它。
         // 同一个「实测高/声明高」组合只补一次，避免布局回调与重新布局互相触发；声明高再变就是
         // 新的组合，那时再补一次。
-        findItemView(itemView, ids.confirmId)?.let { confirm ->
+        views[ids.confirmId]?.let { confirm ->
             snapshotActionView(confirm, null)
             setRadius(confirm, radius)
             (confirm.layoutParams as? ViewGroup.MarginLayoutParams)?.let { lp ->
@@ -1007,7 +1037,7 @@ internal object WeTypeClipboardWaterfallHooks {
             }
         }
         listOf(ids.addId, ids.bombId, ids.deleteId, ids.confirmId).forEach { id ->
-            val row = findItemView(itemView, id) ?: return@forEach
+            val row = views[id] ?: return@forEach
             if (row.visibility == View.GONE) return@forEach
             val lp = row.layoutParams as? ViewGroup.MarginLayoutParams ?: return@forEach
             if (lp.height == row.height) return@forEach
@@ -1022,10 +1052,11 @@ internal object WeTypeClipboardWaterfallHooks {
      * （上下内边距 + 3 个实测行距，卡片带关键词那一排时再加上那一排的高度）。卡片两行高时正好一样高；
      * 内容很长、卡片更高时按钮块封顶在三行，在卡片里垂直居中。取不到行距（文本还没排版）时只跟卡片走，不封顶。
      */
-    private fun actionBlockHeightPx(itemView: View, card: View): Int {
-        val tv = contentTv(itemView)
+    private fun actionBlockHeightPx(itemView: View, card: View, views: Map<Int, View>? = null): Int {
+        // 文本优先取一次 DFS 的收集结果；没收集过（非校准路径）再 findViewById
+        val tv = findCollected(views, itemView, WeTypeClipboardImageHost.contentTvId) as? TextView
         val maxBlock = if (tv == null) 0 else ClipboardWaterfallLayoutLogic.linesCardHeightPx(
-            chromePx = textChromePx(itemView, tv),
+            chromePx = textChromePx(itemView, tv, views),
             linePitchPx = linePitchPx(tv),
             lines = ClipboardWaterfallLayoutLogic.ACTION_MAX_LINES
         )
@@ -1051,9 +1082,11 @@ internal object WeTypeClipboardWaterfallHooks {
     /** 按列宽与块高摆放一颗按钮。 */
     private fun styleActionButton(
         itemView: View, id: Int, textId: Int, iconId: Int,
-        width: Int, height: Int, marginStart: Int, marginTop: Int, radius: Int, iconSize: Int
+        width: Int, height: Int, marginStart: Int, marginTop: Int, radius: Int, iconSize: Int,
+        views: Map<Int, View>? = null
     ) {
-        val view = findItemView(itemView, id) ?: return
+        // 按钮本身从收集映射里取；文字/图标仍在按钮自己的小子树里找，查找语义不变。
+        val view = findCollected(views, itemView, id) ?: return
         val text = findItemView(view, textId) as? TextView
         snapshotActionView(view, text)
         text?.let {
@@ -1202,41 +1235,51 @@ internal object WeTypeClipboardWaterfallHooks {
      * @param measured 这一轮几何是不是布局之后量出来的。绑定期传 `false`：那时条目还没测量，
      *   读到的卡片高与文本行数都是上一个条目的残留，据此封行数会把新内容多封掉几行、
      *   据此定操作栏会把按钮定成上一个条目的尺寸；宽度与折行视口则照写不误。
+     * @param collected 调用方一次 DFS 收集好的 id→view 映射，直接复用免重查；
+     *   传 null 时本函数自己收集一次。
      */
-    private fun calibrateItem(itemView: View, width: Int, measured: Boolean) {
+    private fun calibrateItem(
+        itemView: View, width: Int, measured: Boolean, collected: Map<Int, View>? = null
+    ) {
         if (width <= 0 || !isWaterfallEnabled()) return
-        val card = findItemView(itemView, containerId)
+        // 一次 DFS 收齐本函数与下游（行数纠偏、操作栏）要用的全部 id，替代原先十几次重复的
+        // findViewById 子树遍历；recalibrateChildren 已收集过就直接传入复用。
+        // 映射里缺 key 与 findViewById 未命中等价（收集器同样跳过 id=0 的防御）。
+        val views = collected ?: collectItemViews(itemView, calibrateViewIds())
+        val card = views[containerId]
         card?.let {
             forceWidth(it, width)
             setWrapHeight(it)
         }
-        findItemView(itemView, WeTypeClipboardImageHost.line1Id)?.let { line1 ->
+        views[WeTypeClipboardImageHost.line1Id]?.let { line1 ->
             forceWidth(line1, width)
             setWrapHeight(line1)
         }
-        findItemView(itemView, WeTypeClipboardImageHost.keyInfoId)?.let { forceWidth(it, width) }
+        views[WeTypeClipboardImageHost.keyInfoId]?.let { forceWidth(it, width) }
         // 折行必需的两步先做完，再碰展开操作栏：后者出任何差错都不能让卡片丢掉右边框、文本不再折行。
-        val scroll = findItemView(itemView, WeTypeClipboardImageHost.contentScrollId)
+        val scroll = views[WeTypeClipboardImageHost.contentScrollId]
         scroll?.let { matchConstraintWidth(it) }
-        contentTv(itemView)?.let { tv ->
+        val tv = views[WeTypeClipboardImageHost.contentTvId] as? TextView
+        tv?.let {
             val viewport = ClipboardWaterfallLayoutLogic.textViewportPx(
                 scrollWidthPx = scroll?.width ?: 0,
                 cardWidthPx = card?.width ?: 0,
                 itemWidthPx = width,
                 knownInsetPx = viewportInsetPx,
-                paddingPx = tv.paddingLeft + tv.paddingRight
+                paddingPx = it.paddingLeft + it.paddingRight
             )
-            if (viewport > 0 && tv.maxWidth != viewport) tv.maxWidth = viewport
+            if (viewport > 0 && it.maxWidth != viewport) it.maxWidth = viewport
         }
         if (measured) {
             if (card != null && scroll != null && scroll.width > 0 && card.width == width) {
                 viewportInsetPx = (card.width - scroll.width).coerceAtLeast(0)
             }
-            correctTextOverflow(itemView)
+            // tv/card 都已在上面取到，直接传下去复用，不再重复 findViewById
+            if (tv != null && card != null) correctTextOverflow(tv, card)
         }
         // 操作栏不跟着 measured 走：绑定期就按当时的卡片高摆一次，第一个布局就是对的尺寸，
         // 不会先露一帧原生的大按钮。卡片高取到 0（新建的条目）时它自己会跳过。
-        runCatching { applyActionMenu(itemView, width) }
+        runCatching { applyActionMenu(itemView, width, views) }
             .onFailure { ModuleLog.e("$TAG: waterfall action menu failed: $it") }
         if (measured) clampItemHeight(itemView, card)
     }
@@ -1282,8 +1325,11 @@ internal object WeTypeClipboardWaterfallHooks {
             .onFailure { ModuleLog.e("$TAG: waterfall calibrate item failed: $it") }
     }
 
-    /** 卡片 → 它所属的条目：卡片的布局回调里要拿到条目才能校准。 */
-    private val cardOwners: MutableMap<View, View> = Collections.synchronizedMap(WeakHashMap())
+    /** 卡片 → 它所属的条目：卡片的布局回调里要拿到条目才能校准。
+     *  值必须持弱引用：WeakHashMap 的值是强引用，而条目(itemView)子树又强持有键(卡片)，
+     *  map→value→key 一旦成环，条目就永远清不出弱表 —— 面板每重建一次就泄漏一整棵 itemView 子树。 */
+    private val cardOwners: MutableMap<View, WeakReference<View>> =
+        Collections.synchronizedMap(WeakHashMap())
 
     /**
      * 卡片自己的布局回调。
@@ -1295,7 +1341,8 @@ internal object WeTypeClipboardWaterfallHooks {
      * 突然变小、上下空出一大块」。所以卡片自己的布局回调也要兜一次。
      */
     private val cardLayoutListener = View.OnLayoutChangeListener { view, _, _, _, _, _, _, _, _ ->
-        val itemView = cardOwners[view] ?: return@OnLayoutChangeListener
+        // 值是弱引用：条目子树被宿主拆掉后这里取不到，就当没有这条记录，直接跳过
+        val itemView = cardOwners[view]?.get() ?: return@OnLayoutChangeListener
         if (itemView.width <= 0 || !isWaterfallEnabled()) return@OnLayoutChangeListener
         runCatching { calibrateItem(itemView, itemView.width, measured = true) }
             .onFailure { ModuleLog.e("$TAG: waterfall card calibrate failed: $it") }
@@ -1305,8 +1352,23 @@ internal object WeTypeClipboardWaterfallHooks {
         if (!calibratedViews.add(itemView)) return
         itemView.addOnLayoutChangeListener(itemLayoutListener)
         findItemView(itemView, containerId)?.let { card ->
-            cardOwners[card] = itemView
+            // 值包成弱引用：见 cardOwners 声明处的说明，避免 map→value→key 强环导致条目泄漏
+            cardOwners[card] = WeakReference(itemView)
             card.addOnLayoutChangeListener(cardLayoutListener)
+        }
+    }
+
+    /**
+     * [attachCalibration] 的配对拆除：关闭瀑布流/热重载清理时摘掉两条校准 listener、清掉弱表记录。
+     * 两条 listener 都是本 object 的单例引用，remove 与 add 用的同一个实例；不摘的话回调
+     * 会一直挂在宿主 View 上，瀑布流关了仍被布局事件反复触发（回调里虽有开关兜底，但旧引用本身成了泄漏源）。
+     */
+    private fun detachCalibration(itemView: View) {
+        calibratedViews.remove(itemView)
+        itemView.removeOnLayoutChangeListener(itemLayoutListener)
+        findItemView(itemView, containerId)?.let { card ->
+            cardOwners.remove(card)
+            card.removeOnLayoutChangeListener(cardLayoutListener)
         }
     }
 
@@ -1315,6 +1377,51 @@ internal object WeTypeClipboardWaterfallHooks {
 
     private fun contentTv(itemView: View): TextView? =
         findItemView(itemView, WeTypeClipboardImageHost.contentTvId) as? TextView
+
+    /** 优先用一次 DFS 收集好的 id→view 映射取视图；没收集过（非校准路径）才退回 findViewById。
+     *  映射刚从同一棵子树收集而来，缺 key 与 findViewById 未命中完全等价。 */
+    private fun findCollected(views: Map<Int, View>?, itemView: View, id: Int): View? =
+        if (views != null) views[id] else findItemView(itemView, id)
+
+    /** 校准路径一次 DFS 要收齐的 id：卡片链 + 文本 + 操作栏按钮/确认键。
+     *  （按钮的文字/图标仍在按钮自己的小子树里找，不在此列。） */
+    private fun calibrateViewIds(): List<Int> {
+        val ids = mutableListOf(
+            containerId,
+            WeTypeClipboardImageHost.line1Id,
+            WeTypeClipboardImageHost.keyInfoId,
+            WeTypeClipboardImageHost.contentScrollId,
+            WeTypeClipboardImageHost.contentTvId
+        )
+        actionIds?.let {
+            ids += listOf(it.containerId, it.addId, it.bombId, it.deleteId, it.confirmId)
+        }
+        return ids
+    }
+
+    /**
+     * 一次先序 DFS 收集子树里目标 id 的视图，与逐个 findViewById 语义一致（先序首个匹配者胜）。
+     * 校准路径原先对同一棵子树做十几次重复遍历，这里一次拿齐再往下传。
+     * id=0 的目标不参与（与 [WeTypeClipboardImageHost.findView] 的 id 防御一致）；
+     * 遍历整体 runCatching，异常时已收到的照用、没收到视为未命中。
+     */
+    private fun collectItemViews(root: View, ids: Collection<Int>): Map<Int, View> {
+        val targets = HashSet<Int>(ids.size)
+        for (id in ids) if (id != 0) targets.add(id)
+        if (targets.isEmpty()) return emptyMap()
+        val found = HashMap<Int, View>(targets.size)
+        runCatching {
+            fun visit(view: View) {
+                if (found.size == targets.size) return
+                val id = view.id
+                if (id != 0 && id in targets && id !in found) found[id] = view
+                if (view !is ViewGroup) return
+                for (i in 0 until view.childCount) visit(view.getChildAt(i))
+            }
+            visit(root)
+        }
+        return found
+    }
 
     private fun forceWidth(view: View, width: Int) {
         if (width <= 0) return
@@ -1355,16 +1462,27 @@ internal object WeTypeClipboardWaterfallHooks {
      * 按类型找：LP 类**自己**只声明两个字段（一个 Span、一个 boolean），取那个 boolean 直接写。
      * 写完用保留下来的无参 boolean getter 自证一次 —— 找错字段时它不会变成 true，会留下日志。
      */
+    /** 分割条 LayoutParams 的 fullSpan 探测结果（boolean 字段 + 自证 getter）。 */
+    private class FullSpanProbe(val field: Field?, val getter: Method?)
+
+    /** 探测结果按 LayoutParams 的类缓存：字段/方法形状对同一个类固定不变，原先每个分割条
+     *  bind 都 declaredFields+methods 全表扫一遍。包装值永远非空，「探测失败」也随包装
+     *  对象缓存下来（getOrPut 对 null 值不生效，所以用包装类而不是可空值）。 */
+    private val fullSpanProbes: MutableMap<Class<*>, FullSpanProbe> =
+        Collections.synchronizedMap(WeakHashMap())
+
     private fun markFullSpan(itemView: View) {
         val lp = itemView.layoutParams ?: return
-        val field = lp.javaClass.declaredFields.firstOrNull {
-            it.type == Boolean::class.javaPrimitiveType && !Modifier.isStatic(it.modifiers)
-        } ?: run {
+        // getOrPut 在 synchronizedMap 上非原子，包一层避免并发时重复探测
+        val probe = synchronized(fullSpanProbes) {
+            fullSpanProbes.getOrPut(lp.javaClass) { probeFullSpan(lp.javaClass) }
+        }
+        val field = probe.field ?: run {
             ModuleLog.e("$TAG: fullSpan field not found on ${lp.javaClass.name}")
             return
         }
+        // isAccessible 已在探测时设过一次，这里只写字段值
         val applied = runCatching {
-            field.isAccessible = true
             field.setBoolean(lp, true)
             true
         }.getOrElse {
@@ -1372,12 +1490,23 @@ internal object WeTypeClipboardWaterfallHooks {
             false
         }
         if (!applied) return
-        val getter = lp.javaClass.methods.firstOrNull {
-            it.parameterTypes.isEmpty() && it.returnType == Boolean::class.javaPrimitiveType
-        }
+        val getter = probe.getter
         if (getter != null && runCatching { getter.invoke(lp) as? Boolean }.getOrNull() != true) {
             ModuleLog.e("$TAG: fullSpan did not stick on ${lp.javaClass.name}")
         }
+    }
+
+    /** 探测某个 LayoutParams 类的 fullSpan 写入点：首个非静态 boolean 实例字段 + 无参 boolean getter。 */
+    private fun probeFullSpan(lpClass: Class<*>): FullSpanProbe {
+        val field = lpClass.declaredFields.firstOrNull {
+            it.type == Boolean::class.javaPrimitiveType && !Modifier.isStatic(it.modifiers)
+        }
+        // Field 缓存后会被反复复用，isAccessible 只需在探测时设一次
+        if (field != null) runCatching { field.isAccessible = true }
+        val getter = lpClass.methods.firstOrNull {
+            it.parameterTypes.isEmpty() && it.returnType == Boolean::class.javaPrimitiveType
+        }
+        return FullSpanProbe(field, getter)
     }
 
     private fun matchWidth(view: View) {
@@ -1409,8 +1538,21 @@ internal object WeTypeClipboardWaterfallHooks {
      * 两种取法是同一个 View），换一版重排字段就可能拿到卡片或文本控件，而整条瀑布流的条目校准都挂在
      * 这个视图上。
      */
+    /** ViewHolder.itemView 字段按 holder 类缓存（含探测失败=null 也缓存，避免重复失败探测）。
+     *  getOrPut 分不清「没缓存」与「缓存了 null」，用 containsKey 判别；
+     *  探测时已设过 isAccessible，缓存命中后直接复用。 */
+    private val holderItemViewFields: MutableMap<Class<*>, Field?> =
+        Collections.synchronizedMap(WeakHashMap())
+
     private fun holderItemView(holder: Any): View? {
-        val field = viewHolderItemViewField(holder.javaClass)
+        val field = synchronized(holderItemViewFields) {
+            if (holderItemViewFields.containsKey(holder.javaClass)) {
+                holderItemViewFields[holder.javaClass]
+            } else {
+                viewHolderItemViewField(holder.javaClass)
+                    .also { holderItemViewFields[holder.javaClass] = it }
+            }
+        }
         if (field == null) {
             if (itemViewMissingLogged.compareAndSet(false, true)) {
                 ModuleLog.e("$TAG: ViewHolder.itemView not found by shape on ${holder.javaClass.name}; waterfall items stay native")

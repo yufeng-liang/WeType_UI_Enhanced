@@ -179,7 +179,12 @@ object HookEnvironment {
 
     private fun nextHookId(executable: Executable, kind: String): String {
         val scope = currentScope.get().ifBlank { "global" }
+        // Constructor.getName() 返回的是构造器名（类简单名，不带 <init>），与同签名的 Method
+        // 在同一 key 空间存在理论碰撞；加类别前缀（Method/Constructor）隔开两类 key。
+        val kindPrefix = if (executable is Method) "Method" else "Constructor"
         val executableKey = buildString {
+            append(kindPrefix)
+            append(':')
             append(executable.declaringClass.name)
             append('#')
             append(executable.name)
@@ -362,7 +367,8 @@ fun Constructor<*>.hookAfter(callback: (MethodHookParam) -> Unit) {
     }
 }
 
-fun Method.hookReplace(callback: (MethodHookParam) -> Any?) {    val method = this
+fun Method.hookReplace(callback: (MethodHookParam) -> Any?) {
+    val method = this
     HookEnvironment.registerHook(method, "replace") { chain ->
         val param = MethodHookParam(
             method = method,

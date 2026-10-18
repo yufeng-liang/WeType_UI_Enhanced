@@ -342,7 +342,8 @@ internal object WeTypeClipboardSearchUi {
         val editor = readNativeField(box, "mEditor")
         val content = editor?.let { readNativeField(it, "mInputContentType") }
         val editorAction = content?.let { readNativeField(it, "onEditorActionListener") } as? android.widget.TextView.OnEditorActionListener
-        val listenerGetter = View::class.java.getDeclaredMethod("getListenerInfo").apply { isAccessible = true }
+        // 【审查2修复】getListenerInfo 改用 object 级静态缓存，避免每次快照重新解析反射元数据。
+        val listenerGetter = listenerInfoGetterF41 ?: throw NoSuchMethodException("getListenerInfo")
         val boxListeners = listenerGetter.invoke(box)
         val key = boxListeners?.let { readNativeField(it, "mOnKeyListener") } as? View.OnKeyListener
         val exitListenerInfo = parts.exit?.let { listenerGetter.invoke(it) }
@@ -372,8 +373,24 @@ internal object WeTypeClipboardSearchUi {
             val current = (readNativeField(box, "mListeners") as? List<*>)?.filterIsInstance<TextWatcher>().orEmpty()
             for (watcher in watchers) if (current.none { it === watcher }) box.addTextChangedListener(watcher)
             hintLayoutListenersF41.remove(box)?.let { box.removeOnLayoutChangeListener(it) }
-            box.setOnEditorActionListener(editorAction)
-            box.setOnKeyListener(key)
+            // 【审查2修复】还原 listener 前先核对身份：宿主已自设（当前值非我方实例）则不覆盖；
+            // 当前为空或读取失败时按旧行为还原快照原值，保证退壳不残留我方 listener。
+            runCatching {
+                val cur = currentEditorActionListenerOf(box)
+                if (cur === null || cur === ourEditorActionListenerF41) {
+                    box.setOnEditorActionListener(editorAction)
+                }
+            }
+            runCatching {
+                val cur = currentKeyListenerOf(box)
+                if (cur === null || cur === ourKeyListenerF41) {
+                    box.setOnKeyListener(key)
+                }
+            }
+            // 【审查2修复】我方 listener 记账随还原一并清空（换壳/再挂载时重新建账）。
+            ourEditorActionListenerF41 = null
+            ourKeyListenerF41 = null
+            jumpListenersBoxRefF41 = null
             box.hint = hint
             parts.modeTv.text = mode
             // 图标还账：ImageView优先，compound兜底；只恢复我方改过的那一路。
@@ -566,6 +583,25 @@ internal object WeTypeClipboardSearchUi {
     private var f41WatcherGuardHooked = false
     @Volatile
     private var f41TransGuardHooked = false
+    // 【审查2修复】View.getListenerInfo 反射 Method 提为 object 级静态缓存（原两处每次重新 getDeclaredMethod）。
+    private val listenerInfoGetterF41: java.lang.reflect.Method? =
+        runCatching {
+            View::class.java.getDeclaredMethod("getListenerInfo").apply { isAccessible = true }
+        }.getOrNull()
+    // 【审查2修复】我方回车 listener 实例记账（object 级单槽：翻译壳同一时刻仅一个搜索框）。
+    // 重申/还原前先反射读当前 listener 做实例身份比对，宿主自设过则不再覆盖（防吞宿主 listener）。
+    @Volatile
+    private var ourEditorActionListenerF41: android.widget.TextView.OnEditorActionListener? = null
+    @Volatile
+    private var ourKeyListenerF41: View.OnKeyListener? = null
+    /** 【审查2修复】上述 listener 所属搜索框（弱引用）：同 box 重申复用同一实例，换 box 才重建。 */
+    @Volatile
+    private var jumpListenersBoxRefF41: java.lang.ref.WeakReference<EditText>? = null
+    /** 【审查3修复】回车提交动作集合提为常量，避免每次按键回调重建 setOf。 */
+    private val jumpSubmitActionsF41 = setOf(
+        EditorInfo.IME_ACTION_SEARCH, EditorInfo.IME_ACTION_DONE,
+        EditorInfo.IME_ACTION_GO, EditorInfo.IME_ACTION_SEND
+    )
 
     /**
      * F5图标线（新缝基准）：centerY=图标cluster均值，halfH=簇内图标高均值/2（现算不写死，
@@ -864,6 +900,18 @@ internal object WeTypeClipboardSearchUi {
      * 否则ImeCandidateView类型首个命中，再否则同类实例值首个命中），找不到再回退decor树
      * 按类名找（与mountStripInCandidateContainer同口径BFS）。任一未命中返null，上层keep orig。
      */
+    /** 【审查1修复】mCandidateView 三段字段（同名/同型/全量）缓存条目：candCls 变更（合同重解析）时整体重建。 */
+    private class CandidateFieldTiersF31(
+        val candCls: Class<*>?,
+        val byName: List<java.lang.reflect.Field>,
+        val byType: List<java.lang.reflect.Field>,
+        val all: List<java.lang.reflect.Field>
+    )
+
+    /** 【审查1修复】updateInputView 键盘更新高频路径：declaredFields 遍历结果按宿主类缓存（弱键防泄漏）。 */
+    private val candidateFieldTiersF31: MutableMap<Class<*>, CandidateFieldTiersF31> =
+        Collections.synchronizedMap(WeakHashMap<Class<*>, CandidateFieldTiersF31>())
+
     private fun findCandidateViewForJ3F31(nHost: Any, decor: ViewGroup): ViewGroup? {
         return try {
             val cl = hostClassLoader ?: nHost.javaClass.classLoader
@@ -872,36 +920,35 @@ internal object WeTypeClipboardSearchUi {
                 NATIVE_CANDIDATE_VIEW_CLASS,
                 cl
             )
-            val fields = nHost.javaClass.declaredFields
-            for (f in fields) {
-                if (f.name != "mCandidateView") continue
-                try {
-                    f.isAccessible = true
-                    val v = f.get(nHost) as? ViewGroup
-                    if (v != null) return v
-                } catch (_: Throwable) {
-                    continue
+            // 【审查1修复】字段三段（同名/同型/全量）按宿主类缓存，避免每次键盘更新都遍历 declaredFields；
+            // isAccessible 建缓存时一次置位，命中后只做 get 取值。找不到任何字段的类同样缓存空结果。
+            val tiers = synchronized(candidateFieldTiersF31) {
+                val cached = candidateFieldTiersF31[nHost.javaClass]
+                if (cached != null && cached.candCls === candCls) {
+                    cached
+                } else {
+                    val fields = nHost.javaClass.declaredFields
+                    runCatching { fields.forEach { it.isAccessible = true } }
+                    val built = CandidateFieldTiersF31(
+                        candCls = candCls,
+                        byName = fields.filter { it.name == "mCandidateView" },
+                        byType = if (candCls != null) fields.filter { it.type == candCls } else emptyList(),
+                        all = fields.toList()
+                    )
+                    candidateFieldTiersF31[nHost.javaClass] = built
+                    built
                 }
             }
+            for (f in tiers.byName) {
+                runCatching { f.get(nHost) as? ViewGroup }.getOrNull()?.let { return it }
+            }
             if (candCls != null) {
-                for (f in fields) {
-                    if (f.type != candCls) continue
-                    try {
-                        f.isAccessible = true
-                        val v = f.get(nHost) as? ViewGroup
-                        if (v != null) return v
-                    } catch (_: Throwable) {
-                        continue
-                    }
+                for (f in tiers.byType) {
+                    runCatching { f.get(nHost) as? ViewGroup }.getOrNull()?.let { return it }
                 }
-                for (f in fields) {
-                    try {
-                        f.isAccessible = true
-                        val v = f.get(nHost) as? ViewGroup ?: continue
-                        if (candCls.isInstance(v)) return v
-                    } catch (_: Throwable) {
-                        continue
-                    }
+                for (f in tiers.all) {
+                    val v = runCatching { f.get(nHost) as? ViewGroup }.getOrNull() ?: continue
+                    if (candCls.isInstance(v)) return v
                 }
             }
             val q: ArrayDeque<View> = ArrayDeque()
@@ -1910,8 +1957,8 @@ internal object WeTypeClipboardSearchUi {
         /** Only editor submission actions carry intention; text commits inherit pass-through. */
         override fun performEditorAction(actionCode: Int): Boolean {
             val box = boxRef.get()
-            val submit = actionCode in setOf(EditorInfo.IME_ACTION_SEARCH, EditorInfo.IME_ACTION_DONE,
-                EditorInfo.IME_ACTION_GO, EditorInfo.IME_ACTION_SEND)
+            // 【审查3修复】提交动作集合复用 object 级常量（与 applyJumpHandlersF41 同口径，此处为自查新发现的同模式调用点）。
+            val submit = actionCode in jumpSubmitActionsF41
             if (submit && box != null && isActive(box)) {
                 onEnter?.invoke()
                 return true
@@ -2334,9 +2381,8 @@ internal object WeTypeClipboardSearchUi {
     private fun ensureBackClearHook(backBtn: View) {
         try {
             val listenerInfo = runCatching {
-                val getter = View::class.java.getDeclaredMethod("getListenerInfo")
-                    .apply { isAccessible = true }
-                getter.invoke(backBtn)
+                // 【审查2修复】getListenerInfo 改用 object 级静态缓存，避免每次包装重新解析反射元数据。
+                listenerInfoGetterF41?.invoke(backBtn)
             }.getOrNull() ?: return
             val current = runCatching { readNativeField(listenerInfo, "mOnClickListener") }
                 .getOrNull() as? View.OnClickListener ?: return
@@ -2391,7 +2437,8 @@ internal object WeTypeClipboardSearchUi {
                 }
             }
             if (Looper.myLooper() == Looper.getMainLooper()) run()
-            else Handler(Looper.getMainLooper()).post { run() }
+            // 【审查4修复】复用文件级 mainHandler，避免非主线程分支每次新建匿名 Handler。
+            else mainHandler.post { run() }
         } catch (t: Throwable) {
             AndroidLog.e(TAG, "applyKeywordDirect failed: ${t.message}")
         }
@@ -3427,27 +3474,71 @@ internal object WeTypeClipboardSearchUi {
         }
     }
 
+    /** 【审查2修复】读 EditText 当前 OnEditorActionListener（mEditor→mInputContentType→onEditorActionListener）。
+     *  反射失败或链路不存在均返 null；reassert 路径将 null 视作"非我方实例"（保守不覆盖）。 */
+    private fun currentEditorActionListenerOf(box: EditText): android.widget.TextView.OnEditorActionListener? =
+        runCatching {
+            val editor = readNativeField(box, "mEditor")
+            val content = editor?.let { readNativeField(it, "mInputContentType") }
+            content?.let { readNativeField(it, "onEditorActionListener") } as? android.widget.TextView.OnEditorActionListener
+        }.getOrNull()
+
+    /** 【审查2修复】读 View 当前 OnKeyListener（getListenerInfo→mOnKeyListener）；失败或空返 null（同上保守处理）。 */
+    private fun currentKeyListenerOf(view: View): View.OnKeyListener? =
+        runCatching {
+            listenerInfoGetterF41?.invoke(view)?.let { readNativeField(it, "mOnKeyListener") } as? View.OnKeyListener
+        }.getOrNull()
+
     /** Editor/hardware enter paths share the native action session and are idempotent. */
     private fun applyJumpHandlersF41(box: EditText, reason: String) {
         if (!ownsSearchBox(box)) return
-        box.setOnEditorActionListener { _, action, event ->
+        // 【审查2修复】重申（reassert*）前先反射读当前 listener 做实例身份比对：
+        // 某一路当前值非我方实例（宿主自设/清空，或读取失败返 null）则该路跳过，不再覆盖宿主 listener；
+        // 首次挂载（wire）不做身份检查、无条件设置，行为与旧版完全一致（仅提取实例记账）。
+        val reassert = reason != "wire"
+        val skipEditor = reassert && currentEditorActionListenerOf(box) !== ourEditorActionListenerF41
+        val skipKey = reassert && currentKeyListenerOf(box) !== ourKeyListenerF41
+        if (skipEditor && skipKey) {
+            AndroidLog.i(TAG, "strip F41 jump reassert skipped ($reason): host listener took over")
+            return
+        }
+        // 【审查2修复】同 box 重申必须复用同一 listener 实例（身份比对的前提），换 box 才重建。
+        val sameBox = jumpListenersBoxRefF41?.get() === box
+        if (!skipEditor) {
+            val l = (if (sameBox) ourEditorActionListenerF41 else null) ?: newEditorJumpListenerF41(box)
+            box.setOnEditorActionListener(l)
+            ourEditorActionListenerF41 = l
+        }
+        if (!skipKey) {
+            val l = (if (sameBox) ourKeyListenerF41 else null) ?: newKeyJumpListenerF41(box)
+            box.setOnKeyListener(l)
+            ourKeyListenerF41 = l
+        }
+        jumpListenersBoxRefF41 = java.lang.ref.WeakReference(box)
+    }
+
+    /** 【审查2修复】回车 EditorAction 监听工厂（原内联 lambda 提出，便于实例记账与身份比对）。 */
+    private fun newEditorJumpListenerF41(box: EditText): android.widget.TextView.OnEditorActionListener =
+        android.widget.TextView.OnEditorActionListener { _, action, event ->
             val enter = event?.keyCode == android.view.KeyEvent.KEYCODE_ENTER ||
                 event?.keyCode == android.view.KeyEvent.KEYCODE_NUMPAD_ENTER
-            val submit = action in setOf(EditorInfo.IME_ACTION_SEARCH, EditorInfo.IME_ACTION_DONE,
-                EditorInfo.IME_ACTION_GO, EditorInfo.IME_ACTION_SEND) || enter
+            // 【审查3修复】提交动作集合改用 object 级常量，不再每次回调重建 setOf。
+            val submit = action in jumpSubmitActionsF41 || enter
             if (!submit || !ownsSearchBox(box)) false else {
                 if (event == null || event.action == android.view.KeyEvent.ACTION_DOWN)
                     jumpBackToClipboardF41("editor-$action")
                 true
             }
         }
-        box.setOnKeyListener { _, key, event ->
+
+    /** 【审查2修复】硬回车 OnKey 监听工厂（同上提出，便于实例记账与身份比对）。 */
+    private fun newKeyJumpListenerF41(box: EditText): View.OnKeyListener =
+        View.OnKeyListener { _, key, event ->
             if ((key == android.view.KeyEvent.KEYCODE_ENTER || key == android.view.KeyEvent.KEYCODE_NUMPAD_ENTER) && ownsSearchBox(box)) {
                 if (event.action == android.view.KeyEvent.ACTION_DOWN) jumpBackToClipboardF41("enter-key")
                 true
             } else false
         }
-    }
 
     /** C47隔离：摘原生翻译watcher（只读快照+官方remove，禁动我方watcher；失败fail-closed只记日志）。 */
     private fun detachNativeTranslationWatchersF41(box: EditText, keep: TextWatcher): Int {
@@ -3781,7 +3872,8 @@ internal object WeTypeClipboardSearchUi {
             if (left % 4 == 0) {
                 AndroidLog.i(TAG, "waiting keyboard page switch, left=$left")
             }
-            Handler(Looper.getMainLooper()).postDelayed({
+            // 【审查4修复】复用文件级 mainHandler，避免轮询每次新建匿名 Handler。
+            mainHandler.postDelayed({
                 pollKeyboardThenMount(decor, kbId, left - 1)
             }, 150)
         } catch (t: Throwable) {
@@ -5987,16 +6079,41 @@ internal object WeTypeClipboardSearchUi {
      * F25 [0]内容快照（只读不碰视图）：adapter经getAdapter/getItemCount反射现取（失败记-1），
      * 首项文字取可见子树首个非空TextView（截24字，BFS上限80）。任一异常返空快照（调用方fail-closed）。
      */
+    // 【审查5修复】F25 快照反射 Method 按类缓存（弱键防泄漏，null 也缓存）：
+    // getAdapter 按各 RecyclerView 子类、getItemCount 按 adapter 类。
+    private val recyclerGetAdapterByClassF25: MutableMap<Class<*>, java.lang.reflect.Method?> =
+        Collections.synchronizedMap(WeakHashMap<Class<*>, java.lang.reflect.Method?>())
+    private val adapterItemCountByClassF25: MutableMap<Class<*>, java.lang.reflect.Method?> =
+        Collections.synchronizedMap(WeakHashMap<Class<*>, java.lang.reflect.Method?>())
+
+    /** 【审查5修复】按类缓存公共 Method 的通用读法（vararg 参数表，低频路径顺手缓存，null 也缓存）。 */
+    private fun cachedMethodOfF25(
+        cache: MutableMap<Class<*>, java.lang.reflect.Method?>,
+        cls: Class<*>,
+        name: String,
+        vararg params: Class<*>
+    ): java.lang.reflect.Method? =
+        synchronized(cache) {
+            if (cache.containsKey(cls)) cache[cls]
+            else {
+                val m = runCatching { cls.getMethod(name, *params) }.getOrNull()
+                cache[cls] = m
+                m
+            }
+        }
+
     private fun kid0WhoOfF25(kid: View): Kid0WhoF25 {
         return try {
             val cls = kid.javaClass.name
             val isRecycler = cls.contains("RecyclerView")
             var adapterCount = -1
             if (isRecycler) {
+                // 【审查5修复】getAdapter/getItemCount 反射改走按类缓存（低频路径，成本低于风险）。
                 adapterCount = runCatching {
-                    val adapter = kid.javaClass.getMethod("getAdapter").invoke(kid)
+                    val adapter = cachedMethodOfF25(recyclerGetAdapterByClassF25, kid.javaClass, "getAdapter")
+                        ?.invoke(kid) ?: return@runCatching -1
+                    val m = cachedMethodOfF25(adapterItemCountByClassF25, adapter.javaClass, "getItemCount")
                         ?: return@runCatching -1
-                    val m = adapter.javaClass.getMethod("getItemCount")
                     (m.invoke(adapter) as? Int) ?: -1
                 }.getOrDefault(-1)
             }
@@ -8527,13 +8644,11 @@ internal object WeTypeClipboardSearchUi {
                     "(fail-closed, N+requestLayout照走不拦面板切换)")
                 return
             }
-            val inst = fClass.declaredFields
-                .firstOrNull { it.type == fClass }
-                ?.also { it.isAccessible = true }
-                ?.get(null) ?: run {
-                    AndroidLog.e(TAG, "float refresh: float singleton missing")
-                    return
-                }
+            // 【审查5修复】自类型单例字段查找复用按类缓存（与翻译条高度流同模式，原为每次 declaredFields 遍历）。
+            val inst = singletonFieldOfF41(fClass)?.get(null) ?: run {
+                AndroidLog.e(TAG, "float refresh: float singleton missing")
+                return
+            }
             val vis = pickHostMethod(fClass, "V") { it.parameterTypes.isEmpty() } ?: run {
                 AndroidLog.e(TAG, "float refresh: V() missing")
                 return
@@ -8566,6 +8681,30 @@ internal object WeTypeClipboardSearchUi {
     private const val NATIVE_HEIGHT_MGR_CLASS =
         "com.tencent.wetype.plugin.hld.translatingwhilewriting.q"
 
+    // 【审查5修复】"按类找自类型单例字段"（q/N 都是宿主单例模式）结果按类缓存（弱键防泄漏，null 也缓存）。
+    private val singletonFieldByClassF41: MutableMap<Class<*>, java.lang.reflect.Field?> =
+        Collections.synchronizedMap(WeakHashMap<Class<*>, java.lang.reflect.Field?>())
+
+    /** 【审查5修复】宿主单例字段（type==cls 的 declaredField）按类缓存查找；isAccessible 建缓存时一次置位。 */
+    private fun singletonFieldOfF41(cls: Class<*>): java.lang.reflect.Field? =
+        synchronized(singletonFieldByClassF41) {
+            if (singletonFieldByClassF41.containsKey(cls)) {
+                singletonFieldByClassF41[cls]
+            } else {
+                val f = runCatching {
+                    cls.declaredFields.firstOrNull { it.type == cls }?.also { it.isAccessible = true }
+                }.getOrNull()
+                singletonFieldByClassF41[cls] = f
+                f
+            }
+        }
+
+    // 【审查5修复】高度流 StateFlow 的 setValue/getValue 反射 Method 按类缓存（flow.javaClass 为宿主固定类，稳定）。
+    private val flowSetValueByClassF41: MutableMap<Class<*>, java.lang.reflect.Method?> =
+        Collections.synchronizedMap(WeakHashMap<Class<*>, java.lang.reflect.Method?>())
+    private val flowGetValueByClassF41: MutableMap<Class<*>, java.lang.reflect.Method?> =
+        Collections.synchronizedMap(WeakHashMap<Class<*>, java.lang.reflect.Method?>())
+
     /**
      * 发布条高到原生高度流（k 同信号）：`q.Y().setValue(h)`。
      * 收集器常驻→浮窗 `u0` 重排→底部面板向上撑。height<=0 表拆除。
@@ -8595,10 +8734,8 @@ internal object WeTypeClipboardSearchUi {
                 AndroidLog.e(TAG, "height flow: translating q missing")
                 return
             }
-            val mgr = qClass.declaredFields
-                .firstOrNull { it.type == qClass }
-                ?.also { it.isAccessible = true }
-                ?.get(null) ?: run {
+            // 【审查5修复】q 单例字段查找改走按类缓存（低频路径顺手缓存，弱键防泄漏）。
+            val mgr = singletonFieldOfF41(qClass)?.get(null) ?: run {
                     AndroidLog.e(TAG, "height flow: q singleton missing")
                     return
                 }
@@ -8611,15 +8748,16 @@ internal object WeTypeClipboardSearchUi {
                 AndroidLog.e(TAG, "height flow: Y() null")
                 return
             }
-            val setValue = runCatching {
-                flow.javaClass.getMethod("setValue", Any::class.java)
-            }.getOrNull() ?: run {
+            // 【审查5修复】setValue/getValue 反射改走按类缓存（flow.javaClass 为宿主固定 StateFlow 类，稳定）。
+            val setValue = cachedMethodOfF25(
+                flowSetValueByClassF41, flow.javaClass, "setValue", Any::class.java
+            ) ?: run {
                 AndroidLog.e(TAG, "height flow: setValue missing")
                 return
             }
             setValue.invoke(flow, height)
             val cur = runCatching {
-                flow.javaClass.getMethod("getValue").invoke(flow)
+                cachedMethodOfF25(flowGetValueByClassF41, flow.javaClass, "getValue")?.invoke(flow)
             }.getOrNull()
             AndroidLog.i(TAG, "height flow published h=$height prev=$cur ($reason)")
             AndroidLog.i(TAG, "strip F29 mount-once: Y-flow publish h=$height cur=$cur reason=$reason " +
@@ -8659,10 +8797,8 @@ internal object WeTypeClipboardSearchUi {
                 AndroidLog.e(TAG, "cand refresh: N missing ($reason)")
                 return
             }
-            val inst = nClass.declaredFields
-                .firstOrNull { it.type == nClass }
-                ?.also { it.isAccessible = true }
-                ?.get(null) ?: run {
+            // 【审查5修复】N 单例字段查找改走按类缓存（与高度流 q 共用 singletonFieldOfF41，弱键防泄漏）。
+            val inst = singletonFieldOfF41(nClass)?.get(null) ?: run {
                     AndroidLog.e(TAG, "cand refresh: N singleton missing ($reason)")
                     return
                 }
