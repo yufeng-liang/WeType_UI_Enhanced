@@ -71,7 +71,14 @@ class HostPreferencesFileTest {
         assertEquals(60, reader.read()["blur_radius"])
         val replacement = temporaryFolder.newFile("replacement.xml")
         replacement.writeText("""<map><int name="blur_radius" value="20" /></map>""")
-        check(replacement.renameTo(file))
+        // 另一个写入者的提交是「整体替换」：Linux 的 renameTo 原子覆盖目标，
+        // Windows JVM 的 renameTo 在目标已存在时返回 false，因此这里用
+        // REPLACE_EXISTING 的 Files.move 表达同一语义（行为等价，跨平台可跑）。
+        java.nio.file.Files.move(
+            replacement.toPath(),
+            file.toPath(),
+            java.nio.file.StandardCopyOption.REPLACE_EXISTING
+        )
         assertEquals(20, reader.read()["blur_radius"])
     }
 

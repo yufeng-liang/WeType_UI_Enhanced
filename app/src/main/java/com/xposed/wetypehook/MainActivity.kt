@@ -410,7 +410,7 @@ internal fun WeTypeSettingsApp(
 }
 
 @Composable
-private fun SyncSystemBars(darkMode: Boolean) {
+internal fun SyncSystemBars(darkMode: Boolean) {
     val view = LocalView.current
     if (view.isInEditMode) return
 
@@ -527,6 +527,42 @@ private fun WeTypeSettingsScreen(
     var disableHotUpdate by rememberSaveable {
         mutableStateOf(snapshot.disableHotUpdate)
     }
+    var showCrossDeviceClipboard by rememberSaveable {
+        mutableStateOf(snapshot.showCrossDeviceClipboard)
+    }
+    var removeClipboardRetentionLimit by rememberSaveable {
+        mutableStateOf(snapshot.removeClipboardRetentionLimit)
+    }
+    var removeClipboardTextLimit by rememberSaveable {
+        mutableStateOf(snapshot.removeClipboardTextLimit)
+    }
+    var clipboardImageAdjustRatio by rememberSaveable {
+        mutableStateOf(snapshot.clipboardImageAdjustRatio)
+    }
+    var clipboardImageCrop by rememberSaveable {
+        mutableStateOf(snapshot.clipboardImageCrop)
+    }
+    var clipboardImageUniformRowHeight by rememberSaveable {
+        mutableStateOf(snapshot.clipboardImageUniformRowHeight)
+    }
+    var clipboardImageMaxCount by rememberSaveable {
+        mutableIntStateOf(snapshot.clipboardImageMaxCount)
+    }
+    var clipboardImageMaxSizeMb by rememberSaveable {
+        mutableIntStateOf(snapshot.clipboardImageMaxSizeMb)
+    }
+    var clipboardSearchEnabled by rememberSaveable {
+        mutableStateOf(snapshot.clipboardSearchEnabled)
+    }
+    var clipboardSearchClearOnBack by rememberSaveable {
+        mutableStateOf(snapshot.clipboardSearchClearOnBack)
+    }
+    var clipboardWaterfallFlowEnabled by rememberSaveable {
+        mutableStateOf(snapshot.clipboardWaterfallFlowEnabled)
+    }
+    var clipboardWaterfallMaxHeightDp by rememberSaveable {
+        mutableIntStateOf(snapshot.clipboardWaterfallMaxHeightDp)
+    }
     val appearanceGroupColors = rememberSaveable(
         saver = listSaver(
             save = { it.toList() },
@@ -608,6 +644,18 @@ private fun WeTypeSettingsScreen(
             disableHotUpdate = disableHotUpdate,
             hyperMaterialEnabled = hyperMaterialEnabled,
             glassOverrides = glassOverridesToSave,
+            showCrossDeviceClipboard = showCrossDeviceClipboard,
+            removeClipboardRetentionLimit = removeClipboardRetentionLimit,
+            removeClipboardTextLimit = removeClipboardTextLimit,
+            clipboardImageAdjustRatio = clipboardImageAdjustRatio,
+            clipboardImageCrop = clipboardImageCrop,
+            clipboardImageUniformRowHeight = clipboardImageUniformRowHeight,
+            clipboardImageMaxCount = clipboardImageMaxCount,
+            clipboardImageMaxSizeMb = clipboardImageMaxSizeMb,
+            clipboardSearchEnabled = clipboardSearchEnabled,
+            clipboardSearchClearOnBack = clipboardSearchClearOnBack,
+            clipboardWaterfallFlowEnabled = clipboardWaterfallFlowEnabled,
+            clipboardWaterfallMaxHeightDp = clipboardWaterfallMaxHeightDp,
             onPersisted = { saved ->
                 Toast.makeText(
                     context,
@@ -638,6 +686,10 @@ private fun WeTypeSettingsScreen(
         customIconPath = WeTypeSettings.DEFAULT_CUSTOM_ICON_PATH
         iconScale = WeTypeSettings.DEFAULT_ICON_SCALE
         disableHotUpdate = WeTypeSettings.DEFAULT_DISABLE_HOT_UPDATE
+        clipboardSearchEnabled = WeTypeSettings.DEFAULT_CLIPBOARD_SEARCH_ENABLED
+        clipboardSearchClearOnBack = WeTypeSettings.DEFAULT_CLIPBOARD_SEARCH_CLEAR_ON_BACK
+        clipboardWaterfallFlowEnabled = WeTypeSettings.DEFAULT_CLIPBOARD_WATERFALL_FLOW_ENABLED
+        clipboardWaterfallMaxHeightDp = WeTypeSettings.DEFAULT_CLIPBOARD_WATERFALL_MAX_HEIGHT_DP
         appearanceGroups.forEachIndexed { index, group ->
             appearanceGroupColors[index] = group.defaultColor
         }
@@ -1028,6 +1080,43 @@ private fun WeTypeSettingsScreen(
                     }
                 }
             }
+
+            // 剪贴板增强分组
+            ClipboardSubPageContent(
+                showCrossDeviceClipboard = showCrossDeviceClipboard,
+                onShowCrossDeviceClipboardChange = { showCrossDeviceClipboard = it },
+                removeClipboardRetentionLimit = removeClipboardRetentionLimit,
+                onRemoveClipboardRetentionLimitChange = { removeClipboardRetentionLimit = it },
+                removeClipboardTextLimit = removeClipboardTextLimit,
+                onRemoveClipboardTextLimitChange = { removeClipboardTextLimit = it },
+                clipboardImageAdjustRatio = clipboardImageAdjustRatio,
+                onClipboardImageAdjustRatioChange = { clipboardImageAdjustRatio = it },
+                clipboardImageCrop = clipboardImageCrop,
+                onClipboardImageCropChange = { clipboardImageCrop = it },
+                clipboardImageUniformRowHeight = clipboardImageUniformRowHeight,
+                onClipboardImageUniformRowHeightChange = { clipboardImageUniformRowHeight = it },
+                clipboardImageMaxCount = clipboardImageMaxCount,
+                onClipboardImageMaxCountChange = { clipboardImageMaxCount = it },
+                clipboardImageMaxSizeMb = clipboardImageMaxSizeMb,
+                onClipboardImageMaxSizeMbChange = { clipboardImageMaxSizeMb = it },
+                clipboardSearchEnabled = clipboardSearchEnabled,
+                onClipboardSearchEnabledChange = { clipboardSearchEnabled = it },
+                clipboardSearchClearOnBack = clipboardSearchClearOnBack,
+                onClipboardSearchClearOnBackChange = { clipboardSearchClearOnBack = it },
+                clipboardWaterfallFlowEnabled = clipboardWaterfallFlowEnabled,
+                onClipboardWaterfallFlowEnabledChange = { clipboardWaterfallFlowEnabled = it },
+                clipboardWaterfallMaxHeightDp = clipboardWaterfallMaxHeightDp,
+                onClipboardWaterfallMaxHeightDpChange = { clipboardWaterfallMaxHeightDp = it },
+                onOpenClipboardBackup = {
+                    if (!WeTypeHostLauncher.launchBackupPage(hostActivity)) {
+                        Toast.makeText(
+                            context,
+                            R.string.settings_clipboard_backup_unavailable,
+                            Toast.LENGTH_SHORT
+                        ).show()
+                    }
+                }
+            )
 
             // 操作分组
             item {

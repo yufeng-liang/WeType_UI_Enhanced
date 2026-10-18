@@ -1,11 +1,12 @@
 package com.xposed.wetypehook.xposed
 
+import java.lang.reflect.Executable
 import java.lang.reflect.Method
 
 private object StaticHookThisObject
 
 class MethodHookParam internal constructor(
-    val method: Method,
+    val method: Executable,
     thisObject: Any?,
     private val originalArgs: List<Any?>,
     result: Any? = null

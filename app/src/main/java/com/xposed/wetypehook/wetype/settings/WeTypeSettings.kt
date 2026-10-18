@@ -36,6 +36,34 @@ object WeTypeSettings {
     private const val KEY_TOOLBAR_ICON_BG_OPACITY = "toolbar_icon_bg_opacity"
     private const val KEY_CUSTOM_ICON_PATH = "custom_icon_path"
     private const val KEY_ICON_SCALE = "icon_scale"
+
+    const val KEY_SHOW_CROSS_DEVICE_CLIPBOARD = "show_cross_device_clipboard"
+    const val KEY_REMOVE_CLIPBOARD_RETENTION_LIMIT = "remove_clipboard_retention_limit"
+    const val KEY_REMOVE_CLIPBOARD_TEXT_LIMIT = "remove_clipboard_text_limit"
+    const val KEY_CLIPBOARD_IMAGE_ADJUST_RATIO = "clipboard_image_adjust_ratio"
+    const val KEY_CLIPBOARD_IMAGE_CROP = "clipboard_image_crop"
+    const val KEY_CLIPBOARD_IMAGE_UNIFORM_ROW_HEIGHT = "clipboard_image_uniform_row_height"
+    const val KEY_CLIPBOARD_IMAGE_MAX_COUNT = "clipboard_image_max_count"
+    const val KEY_CLIPBOARD_IMAGE_MAX_SIZE_MB = "clipboard_image_max_size_mb"
+
+    // 剪贴板搜索（Slice 4/5）：开关 + 返回清理关键词。
+    const val KEY_CLIPBOARD_SEARCH = "clipboard_search_enabled"
+    const val KEY_CLIPBOARD_SEARCH_CLEAR_ON_BACK = "clipboard_search_clear_on_back"
+
+    // 剪贴板双列瀑布流：开关 + 卡片最大高度（dp）。
+    const val KEY_CLIPBOARD_WATERFALL_FLOW = "clipboard_waterfall_flow_enabled"
+    const val KEY_CLIPBOARD_WATERFALL_MAX_HEIGHT_DP = "clipboard_waterfall_max_height_dp"
+
+    // 剪贴板备份与恢复（独立读写，不进入 Snapshot）。
+    const val KEY_BACKUP_LOCAL_FOLDER_URI = "clipboard_backup_local_folder_uri"
+    const val KEY_BACKUP_WEBDAV_URL = "clipboard_backup_webdav_url"
+    const val KEY_BACKUP_WEBDAV_USERNAME = "clipboard_backup_webdav_username"
+    const val KEY_BACKUP_WEBDAV_PASSWORD = "clipboard_backup_webdav_password"
+    const val KEY_BACKUP_WEBDAV_REMOTE_DIR = "clipboard_backup_webdav_remote_dir"
+    const val KEY_BACKUP_WEBDAV_KEEP_COUNT = "clipboard_backup_webdav_keep_count"
+    const val KEY_BACKUP_WEBDAV_ALLOW_SELF_SIGNED = "clipboard_backup_webdav_allow_self_signed"
+    const val KEY_BACKUP_PRE_EXPORT_DOWNLOAD = "clipboard_backup_pre_export_download"
+
     const val DEFAULT_LIGHT_COLOR = 0xBDD4D4D4.toInt()
     const val DEFAULT_DARK_COLOR = 0x40000000
     const val DEFAULT_HYPER_MATERIAL_ENABLED = false
@@ -57,6 +85,52 @@ object WeTypeSettings {
     const val DEFAULT_ICON_SCALE = 1.0f
     const val MIN_ICON_SCALE = 0.6f
     const val MAX_ICON_SCALE = 1.4f
+
+    const val DEFAULT_SHOW_CROSS_DEVICE_CLIPBOARD = true
+    const val DEFAULT_REMOVE_CLIPBOARD_RETENTION_LIMIT = true
+    const val DEFAULT_REMOVE_CLIPBOARD_TEXT_LIMIT = true
+
+    // 剪贴板图片缩略图：默认保持原比例、完整显示、统一两行高度。
+    // adjustRatio=false 时统一为正方形；crop=true 时在目标框内居中裁剪填满。
+    const val DEFAULT_CLIPBOARD_IMAGE_ADJUST_RATIO = true
+    const val DEFAULT_CLIPBOARD_IMAGE_CROP = false
+    const val DEFAULT_CLIPBOARD_IMAGE_UNIFORM_ROW_HEIGHT = true
+
+    // 剪贴板图片留存上限：默认 100 张 / 512 MB，超出后从最旧开始清理。0 表示无上限。
+    const val DEFAULT_CLIPBOARD_IMAGE_MAX_COUNT = 100
+    const val DEFAULT_CLIPBOARD_IMAGE_MAX_SIZE_MB = 512
+    const val CLIPBOARD_IMAGE_LIMIT_UNLIMITED = 0
+    const val CLIPBOARD_IMAGE_MIN_COUNT = 1
+    const val CLIPBOARD_IMAGE_MAX_COUNT_LIMIT = 2000
+    const val CLIPBOARD_IMAGE_MIN_SIZE_MB = 16
+    const val CLIPBOARD_IMAGE_MAX_SIZE_MB_LIMIT = 8192
+
+    // 剪贴板搜索默认开启；返回时默认清理关键词。
+    const val DEFAULT_CLIPBOARD_SEARCH_ENABLED = true
+    const val DEFAULT_CLIPBOARD_SEARCH_CLEAR_ON_BACK = true
+
+    // 瀑布流默认关闭；卡片最大高度默认 140dp，夹在 80~300dp。
+    const val DEFAULT_CLIPBOARD_WATERFALL_FLOW_ENABLED = false
+    const val DEFAULT_CLIPBOARD_WATERFALL_MAX_HEIGHT_DP = 140
+    const val CLIPBOARD_WATERFALL_MIN_HEIGHT_DP = 80
+    const val CLIPBOARD_WATERFALL_MAX_HEIGHT_DP_LIMIT = 300
+
+    fun sanitizeClipboardWaterfallMaxHeightDp(value: Int): Int =
+        value.coerceIn(CLIPBOARD_WATERFALL_MIN_HEIGHT_DP, CLIPBOARD_WATERFALL_MAX_HEIGHT_DP_LIMIT)
+
+    fun sanitizeClipboardImageMaxCount(value: Int): Int =
+        if (value <= CLIPBOARD_IMAGE_LIMIT_UNLIMITED) {
+            CLIPBOARD_IMAGE_LIMIT_UNLIMITED
+        } else {
+            value.coerceIn(CLIPBOARD_IMAGE_MIN_COUNT, CLIPBOARD_IMAGE_MAX_COUNT_LIMIT)
+        }
+
+    fun sanitizeClipboardImageMaxSizeMb(value: Int): Int =
+        if (value <= CLIPBOARD_IMAGE_LIMIT_UNLIMITED) {
+            CLIPBOARD_IMAGE_LIMIT_UNLIMITED
+        } else {
+            value.coerceIn(CLIPBOARD_IMAGE_MIN_SIZE_MB, CLIPBOARD_IMAGE_MAX_SIZE_MB_LIMIT)
+        }
 
     private val legacyKeyColorDefaults = mapOf(
         LIGHT_KEY_COLOR_GROUP_ID to 0xFFfcfcfe.toInt(),
@@ -89,6 +163,18 @@ object WeTypeSettings {
         val iconScale: Float,
         val disableHotUpdate: Boolean,
         val hyperMaterialEnabled: Boolean,
+        val showCrossDeviceClipboard: Boolean,
+        val removeClipboardRetentionLimit: Boolean,
+        val removeClipboardTextLimit: Boolean,
+        val clipboardImageAdjustRatio: Boolean,
+        val clipboardImageCrop: Boolean,
+        val clipboardImageUniformRowHeight: Boolean,
+        val clipboardImageMaxCount: Int,
+        val clipboardImageMaxSizeMb: Int,
+        val clipboardSearchEnabled: Boolean = DEFAULT_CLIPBOARD_SEARCH_ENABLED,
+        val clipboardSearchClearOnBack: Boolean = DEFAULT_CLIPBOARD_SEARCH_CLEAR_ON_BACK,
+        val clipboardWaterfallFlowEnabled: Boolean = DEFAULT_CLIPBOARD_WATERFALL_FLOW_ENABLED,
+        val clipboardWaterfallMaxHeightDp: Int = DEFAULT_CLIPBOARD_WATERFALL_MAX_HEIGHT_DP,
         val glassOverrides: GlassMaterialOverrides = GlassMaterialOverrides()
     )
 
@@ -175,6 +261,18 @@ object WeTypeSettings {
         disableHotUpdate: Boolean = DEFAULT_DISABLE_HOT_UPDATE,
         hyperMaterialEnabled: Boolean = DEFAULT_HYPER_MATERIAL_ENABLED,
         glassOverrides: GlassMaterialOverrides = GlassMaterialOverrides(),
+        showCrossDeviceClipboard: Boolean,
+        removeClipboardRetentionLimit: Boolean,
+        removeClipboardTextLimit: Boolean,
+        clipboardImageAdjustRatio: Boolean,
+        clipboardImageCrop: Boolean,
+        clipboardImageUniformRowHeight: Boolean,
+        clipboardImageMaxCount: Int,
+        clipboardImageMaxSizeMb: Int,
+        clipboardSearchEnabled: Boolean = DEFAULT_CLIPBOARD_SEARCH_ENABLED,
+        clipboardSearchClearOnBack: Boolean = DEFAULT_CLIPBOARD_SEARCH_CLEAR_ON_BACK,
+        clipboardWaterfallFlowEnabled: Boolean = DEFAULT_CLIPBOARD_WATERFALL_FLOW_ENABLED,
+        clipboardWaterfallMaxHeightDp: Int = DEFAULT_CLIPBOARD_WATERFALL_MAX_HEIGHT_DP,
         onPersisted: (Boolean) -> Unit = {}
     ): Boolean {
         val snapshot = Snapshot(
@@ -200,6 +298,20 @@ object WeTypeSettings {
             },
             disableHotUpdate = disableHotUpdate,
             hyperMaterialEnabled = hyperMaterialEnabled,
+            showCrossDeviceClipboard = showCrossDeviceClipboard,
+            removeClipboardRetentionLimit = removeClipboardRetentionLimit,
+            removeClipboardTextLimit = removeClipboardTextLimit,
+            clipboardImageAdjustRatio = clipboardImageAdjustRatio,
+            clipboardImageCrop = clipboardImageCrop,
+            clipboardImageUniformRowHeight = clipboardImageUniformRowHeight,
+            clipboardImageMaxCount = sanitizeClipboardImageMaxCount(clipboardImageMaxCount),
+            clipboardImageMaxSizeMb = sanitizeClipboardImageMaxSizeMb(clipboardImageMaxSizeMb),
+            clipboardSearchEnabled = clipboardSearchEnabled,
+            clipboardSearchClearOnBack = clipboardSearchClearOnBack,
+            clipboardWaterfallFlowEnabled = clipboardWaterfallFlowEnabled,
+            clipboardWaterfallMaxHeightDp = sanitizeClipboardWaterfallMaxHeightDp(
+                clipboardWaterfallMaxHeightDp
+            ),
             glassOverrides = glassOverrides
         )
         val appContext = context.applicationContext ?: context
@@ -272,6 +384,93 @@ object WeTypeSettings {
 
     fun isDisableHotUpdateXposed(): Boolean = readSnapshotXposed().disableHotUpdate
 
+    fun isShowCrossDeviceClipboardXposed(): Boolean = readSnapshotXposed().showCrossDeviceClipboard
+
+    fun isRemoveClipboardRetentionLimitXposed(): Boolean =
+        readSnapshotXposed().removeClipboardRetentionLimit
+
+    fun isRemoveClipboardTextLimitXposed(): Boolean = readSnapshotXposed().removeClipboardTextLimit
+
+    fun isClipboardImageAdjustRatioXposed(): Boolean = readSnapshotXposed().clipboardImageAdjustRatio
+
+    fun isClipboardImageCropXposed(): Boolean = readSnapshotXposed().clipboardImageCrop
+
+    fun isClipboardImageUniformRowHeightXposed(): Boolean =
+        readSnapshotXposed().clipboardImageUniformRowHeight
+
+    fun getClipboardImageMaxCountXposed(): Int = readSnapshotXposed().clipboardImageMaxCount
+
+    fun getClipboardImageMaxSizeMbXposed(): Int = readSnapshotXposed().clipboardImageMaxSizeMb
+
+    fun isClipboardSearchEnabledXposed(): Boolean = readSnapshotXposed().clipboardSearchEnabled
+
+    fun isClipboardSearchClearOnBackXposed(): Boolean =
+        readSnapshotXposed().clipboardSearchClearOnBack
+
+    fun isClipboardWaterfallFlowEnabledXposed(): Boolean =
+        readSnapshotXposed().clipboardWaterfallFlowEnabled
+
+    fun getClipboardWaterfallMaxHeightDpXposed(): Int =
+        readSnapshotXposed().clipboardWaterfallMaxHeightDp
+
+    fun readClipboardBackupSettings(context: Context): ClipboardBackupSettings {
+        val preferences = appPreferences(context)
+        return ClipboardBackupSettings(
+            localFolderUri = preferences.getString(KEY_BACKUP_LOCAL_FOLDER_URI, "").orEmpty(),
+            webDavUrl = preferences.getString(KEY_BACKUP_WEBDAV_URL, "").orEmpty(),
+            webDavUsername = preferences.getString(KEY_BACKUP_WEBDAV_USERNAME, "").orEmpty(),
+            webDavPassword = preferences.getString(KEY_BACKUP_WEBDAV_PASSWORD, "").orEmpty(),
+            webDavRemoteDir = preferences.getString(
+                KEY_BACKUP_WEBDAV_REMOTE_DIR,
+                ClipboardBackupSettings.DEFAULT_REMOTE_DIR
+            ).orEmpty(),
+            webDavKeepCount = ClipboardBackupSettings.sanitizeKeepCount(
+                preferences.getInt(
+                    KEY_BACKUP_WEBDAV_KEEP_COUNT,
+                    ClipboardBackupSettings.DEFAULT_KEEP_COUNT
+                )
+            ),
+            webDavAllowSelfSigned = preferences.getBoolean(
+                KEY_BACKUP_WEBDAV_ALLOW_SELF_SIGNED,
+                false
+            ),
+            preExportDownload = preferences.getBoolean(KEY_BACKUP_PRE_EXPORT_DOWNLOAD, false)
+        )
+    }
+
+    fun saveClipboardBackupSettings(
+        context: Context,
+        settings: ClipboardBackupSettings
+    ): Boolean = writeBackupPreferences(appPreferences(context), settings)
+
+    private fun writeBackupPreferences(
+        preferences: SharedPreferences,
+        settings: ClipboardBackupSettings
+    ): Boolean = preferences.edit()
+        .putString(KEY_BACKUP_LOCAL_FOLDER_URI, settings.localFolderUri)
+        .putString(KEY_BACKUP_WEBDAV_URL, settings.webDavUrl)
+        .putString(KEY_BACKUP_WEBDAV_USERNAME, settings.webDavUsername)
+        .putString(KEY_BACKUP_WEBDAV_PASSWORD, settings.webDavPassword)
+        .putString(
+            KEY_BACKUP_WEBDAV_REMOTE_DIR,
+            settings.webDavRemoteDir.ifBlank { ClipboardBackupSettings.DEFAULT_REMOTE_DIR }
+        )
+        .putInt(
+            KEY_BACKUP_WEBDAV_KEEP_COUNT,
+            ClipboardBackupSettings.sanitizeKeepCount(settings.webDavKeepCount)
+        )
+        .putBoolean(KEY_BACKUP_WEBDAV_ALLOW_SELF_SIGNED, settings.webDavAllowSelfSigned)
+        .putBoolean(KEY_BACKUP_PRE_EXPORT_DOWNLOAD, settings.preExportDownload)
+        .commit()
+
+    /**
+     * 偏好文件按宿主包解析：设置页与 Xposed 侧都在宿主进程内运行，读写同一个 PREF_GROUP。
+     */
+    private fun appPreferences(context: Context): SharedPreferences {
+        val appContext = context.applicationContext ?: context
+        return appContext.getSharedPreferences(PREF_GROUP, Context.MODE_PRIVATE)
+    }
+
     fun getAppearanceColorXposed(groupId: String): Int =
         readSnapshotXposed().appearanceColors[groupId]
             ?: WeTypeAppearanceColorGroups.findById(groupId)?.defaultColor
@@ -327,6 +526,24 @@ object WeTypeSettings {
             .putFloat(KEY_ICON_SCALE, snapshot.iconScale)
             .putBoolean(KEY_HYPER_MATERIAL_ENABLED, snapshot.hyperMaterialEnabled)
             .putBoolean(KEY_DISABLE_HOT_UPDATE, snapshot.disableHotUpdate)
+            .putBoolean(KEY_SHOW_CROSS_DEVICE_CLIPBOARD, snapshot.showCrossDeviceClipboard)
+            .putBoolean(KEY_REMOVE_CLIPBOARD_RETENTION_LIMIT, snapshot.removeClipboardRetentionLimit)
+            .putBoolean(KEY_REMOVE_CLIPBOARD_TEXT_LIMIT, snapshot.removeClipboardTextLimit)
+            .putBoolean(KEY_CLIPBOARD_IMAGE_ADJUST_RATIO, snapshot.clipboardImageAdjustRatio)
+            .putBoolean(KEY_CLIPBOARD_IMAGE_CROP, snapshot.clipboardImageCrop)
+            .putBoolean(
+                KEY_CLIPBOARD_IMAGE_UNIFORM_ROW_HEIGHT,
+                snapshot.clipboardImageUniformRowHeight
+            )
+            .putInt(KEY_CLIPBOARD_IMAGE_MAX_COUNT, snapshot.clipboardImageMaxCount)
+            .putInt(KEY_CLIPBOARD_IMAGE_MAX_SIZE_MB, snapshot.clipboardImageMaxSizeMb)
+            .putBoolean(KEY_CLIPBOARD_SEARCH, snapshot.clipboardSearchEnabled)
+            .putBoolean(KEY_CLIPBOARD_SEARCH_CLEAR_ON_BACK, snapshot.clipboardSearchClearOnBack)
+            .putBoolean(KEY_CLIPBOARD_WATERFALL_FLOW, snapshot.clipboardWaterfallFlowEnabled)
+            .putInt(
+                KEY_CLIPBOARD_WATERFALL_MAX_HEIGHT_DP,
+                snapshot.clipboardWaterfallMaxHeightDp
+            )
             .putBoolean(KEY_KEY_OPACITY_MIGRATED, true)
             .remove(KEY_KEY_OPACITY)
         fun writeFloatParameters(key: String, values: List<Float>?, maxCount: Int) {
@@ -422,7 +639,52 @@ object WeTypeSettings {
             },
             hyperMaterialEnabled = getBoolean(KEY_HYPER_MATERIAL_ENABLED, DEFAULT_HYPER_MATERIAL_ENABLED),
             glassOverrides = GlassMaterialOverrides.read(this),
-            disableHotUpdate = getBoolean(KEY_DISABLE_HOT_UPDATE, DEFAULT_DISABLE_HOT_UPDATE)
+            disableHotUpdate = getBoolean(KEY_DISABLE_HOT_UPDATE, DEFAULT_DISABLE_HOT_UPDATE),
+            showCrossDeviceClipboard = getBoolean(
+                KEY_SHOW_CROSS_DEVICE_CLIPBOARD,
+                DEFAULT_SHOW_CROSS_DEVICE_CLIPBOARD
+            ),
+            removeClipboardRetentionLimit = getBoolean(
+                KEY_REMOVE_CLIPBOARD_RETENTION_LIMIT,
+                DEFAULT_REMOVE_CLIPBOARD_RETENTION_LIMIT
+            ),
+            removeClipboardTextLimit = getBoolean(
+                KEY_REMOVE_CLIPBOARD_TEXT_LIMIT,
+                DEFAULT_REMOVE_CLIPBOARD_TEXT_LIMIT
+            ),
+            clipboardImageAdjustRatio = getBoolean(
+                KEY_CLIPBOARD_IMAGE_ADJUST_RATIO,
+                DEFAULT_CLIPBOARD_IMAGE_ADJUST_RATIO
+            ),
+            clipboardImageCrop = getBoolean(KEY_CLIPBOARD_IMAGE_CROP, DEFAULT_CLIPBOARD_IMAGE_CROP),
+            clipboardImageUniformRowHeight = getBoolean(
+                KEY_CLIPBOARD_IMAGE_UNIFORM_ROW_HEIGHT,
+                DEFAULT_CLIPBOARD_IMAGE_UNIFORM_ROW_HEIGHT
+            ),
+            clipboardImageMaxCount = sanitizeClipboardImageMaxCount(
+                getInt(KEY_CLIPBOARD_IMAGE_MAX_COUNT, DEFAULT_CLIPBOARD_IMAGE_MAX_COUNT)
+            ),
+            clipboardImageMaxSizeMb = sanitizeClipboardImageMaxSizeMb(
+                getInt(KEY_CLIPBOARD_IMAGE_MAX_SIZE_MB, DEFAULT_CLIPBOARD_IMAGE_MAX_SIZE_MB)
+            ),
+            clipboardSearchEnabled = getBoolean(
+                KEY_CLIPBOARD_SEARCH,
+                DEFAULT_CLIPBOARD_SEARCH_ENABLED
+            ),
+            clipboardSearchClearOnBack = getBoolean(
+                KEY_CLIPBOARD_SEARCH_CLEAR_ON_BACK,
+                DEFAULT_CLIPBOARD_SEARCH_CLEAR_ON_BACK
+            ),
+            clipboardWaterfallFlowEnabled = getBoolean(
+                KEY_CLIPBOARD_WATERFALL_FLOW,
+                DEFAULT_CLIPBOARD_WATERFALL_FLOW_ENABLED
+            ),
+            clipboardWaterfallMaxHeightDp = sanitizeClipboardWaterfallMaxHeightDp(
+                getInt(
+                    KEY_CLIPBOARD_WATERFALL_MAX_HEIGHT_DP,
+                    DEFAULT_CLIPBOARD_WATERFALL_MAX_HEIGHT_DP
+                )
+            )
         )
     }
 
@@ -462,7 +724,19 @@ object WeTypeSettings {
         iconScale = DEFAULT_ICON_SCALE,
         appearanceColors = WeTypeAppearanceColorGroups.defaultColors(),
         disableHotUpdate = DEFAULT_DISABLE_HOT_UPDATE,
-        hyperMaterialEnabled = DEFAULT_HYPER_MATERIAL_ENABLED
+        hyperMaterialEnabled = DEFAULT_HYPER_MATERIAL_ENABLED,
+        showCrossDeviceClipboard = DEFAULT_SHOW_CROSS_DEVICE_CLIPBOARD,
+        removeClipboardRetentionLimit = DEFAULT_REMOVE_CLIPBOARD_RETENTION_LIMIT,
+        removeClipboardTextLimit = DEFAULT_REMOVE_CLIPBOARD_TEXT_LIMIT,
+        clipboardImageAdjustRatio = DEFAULT_CLIPBOARD_IMAGE_ADJUST_RATIO,
+        clipboardImageCrop = DEFAULT_CLIPBOARD_IMAGE_CROP,
+        clipboardImageUniformRowHeight = DEFAULT_CLIPBOARD_IMAGE_UNIFORM_ROW_HEIGHT,
+        clipboardImageMaxCount = DEFAULT_CLIPBOARD_IMAGE_MAX_COUNT,
+        clipboardImageMaxSizeMb = DEFAULT_CLIPBOARD_IMAGE_MAX_SIZE_MB,
+        clipboardSearchEnabled = DEFAULT_CLIPBOARD_SEARCH_ENABLED,
+        clipboardSearchClearOnBack = DEFAULT_CLIPBOARD_SEARCH_CLEAR_ON_BACK,
+        clipboardWaterfallFlowEnabled = DEFAULT_CLIPBOARD_WATERFALL_FLOW_ENABLED,
+        clipboardWaterfallMaxHeightDp = DEFAULT_CLIPBOARD_WATERFALL_MAX_HEIGHT_DP
     )
 
 }

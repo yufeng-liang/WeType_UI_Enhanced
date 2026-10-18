@@ -4,6 +4,8 @@ import android.util.Log as AndroidLog
 import android.view.View
 import io.github.libxposed.api.XposedInterface
 import io.github.libxposed.api.XposedModule
+import java.lang.reflect.Constructor
+import java.lang.reflect.Executable
 import java.lang.reflect.Field
 import java.lang.reflect.Method
 import java.lang.reflect.Modifier
@@ -161,31 +163,31 @@ object HookEnvironment {
     }
 
     internal fun registerHook(
-        method: Method,
+        executable: Executable,
         kind: String,
         hooker: XposedInterface.Hooker
     ): XposedInterface.HookHandle {
         val module = currentModule
-            ?: throw IllegalStateException("XposedModule is not attached before hooking ${method.name}")
-        val id = nextHookId(method, kind)
-        return module.hook(method)
+            ?: throw IllegalStateException("XposedModule is not attached before hooking ${executable.name}")
+        val id = nextHookId(executable, kind)
+        return module.hook(executable)
             .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
             .setId(id)
             .intercept(hooker)
             .also(hookHandles::add)
     }
 
-    private fun nextHookId(method: Method, kind: String): String {
+    private fun nextHookId(executable: Executable, kind: String): String {
         val scope = currentScope.get().ifBlank { "global" }
         val executableKey = buildString {
-            append(method.declaringClass.name)
+            append(executable.declaringClass.name)
             append('#')
-            append(method.name)
+            append(executable.name)
             append('(')
-            append(method.parameterTypes.joinToString(",") { it.name })
+            append(executable.parameterTypes.joinToString(",") { it.name })
             append(')')
             append(':')
-            append(method.returnType.name)
+            append(if (executable is Method) executable.returnType.name else Void.TYPE.name)
         }
         val sequenceKey = "$scope|$kind|$executableKey"
         val sequence = synchronized(hookSequenceLock) {
@@ -336,21 +338,52 @@ fun Method.hookAfter(callback: (MethodHookParam) -> Unit) {
     }
 }
 
-fun Method.hookReplace(callback: (MethodHookParam) -> Any?) {
-    val method = this
+/**
+ * 构造函数版 [hookAfter]。构造完成后 [MethodHookParam.thisObject] 即新实例，
+ * 用来在对象刚建好、业务还没读到它之前补齐内部字段。
+ */
+fun Constructor<*>.hookAfter(callback: (MethodHookParam) -> Unit) {
+    val constructor = this
+    HookEnvironment.registerHook(constructor, "after") { chain ->
+        val originalResult = chain.proceed()
+        val param = MethodHookParam(
+            method = constructor,
+            thisObject = chain.thisObject,
+            originalArgs = chain.args,
+            result = originalResult
+        )
+        try {
+            callback(param)
+            param.result
+        } catch (throwable: Throwable) {
+            Log.e(throwable)
+            originalResult
+        }
+    }
+}
+
+fun Method.hookReplace(callback: (MethodHookParam) -> Any?) {    val method = this
     HookEnvironment.registerHook(method, "replace") { chain ->
         val param = MethodHookParam(
             method = method,
             thisObject = chain.thisObject,
             originalArgs = chain.args
         )
-        runCatching { callback(param) }.getOrElse { throwable ->
-            Log.e(throwable)
-            val changedArgs = param.changedArgs
-            if (changedArgs == null) chain.proceed() else chain.proceed(changedArgs)
-        }
+        val outcome = runCatching { callback(param) }
+        val failure = outcome.exceptionOrNull()
+        if (failure != null) Log.e(failure)
+        val result = if (failure != null) ProceedWithOriginal else outcome.getOrNull()
+        if (result !== ProceedWithOriginal) return@registerHook result
+        val changedArgs = param.changedArgs
+        if (changedArgs == null) chain.proceed() else chain.proceed(changedArgs)
     }
 }
+
+/**
+ * [hookReplace] 回调返回此哨兵表示放行原方法。不能用 null 代替：原生方法返回 int/long 时
+ * 回传 null 会在拆箱处崩溃，返回对象的方法也可能合法地返回 null。
+ */
+object ProceedWithOriginal
 
 fun Method.hookReturnConstant(result: Any?) {
     val method = this

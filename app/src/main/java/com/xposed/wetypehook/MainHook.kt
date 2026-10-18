@@ -23,9 +23,16 @@ import android.view.inputmethod.InputMethodManager
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.PopupWindow
+import com.xposed.wetypehook.wetype.hook.WeTypeClipboardHooks
+import com.xposed.wetypehook.wetype.hook.WeTypeClipboardImageEntries
+import com.xposed.wetypehook.wetype.hook.WeTypeClipboardImageHost
+import com.xposed.wetypehook.wetype.hook.WeTypeClipboardImageList
+import com.xposed.wetypehook.wetype.hook.WeTypeClipboardImageLoader
+import com.xposed.wetypehook.wetype.hook.WeTypeClipboardRetentionGuard
 import com.xposed.wetypehook.wetype.hook.WeTypeResourceHooks
 import com.xposed.wetypehook.wetype.hook.WeTypeUpdateHooks
 import com.xposed.wetypehook.wetype.hook.WeTypeWindowHooks
+import com.xposed.wetypehook.wetype.host.WeTypeHostContracts
 import com.xposed.wetypehook.wetype.settings.WeTypeSettings
 import com.xposed.wetypehook.xposed.HookEnvironment
 import com.xposed.wetypehook.xposed.Log
@@ -181,8 +188,14 @@ class MainHook : XposedModule() {
                 }
             }
         } else {
-            recordActiveTarget(ActiveTarget(TARGET_KIND_PACKAGE, packageName))
-            startHook(packageName, param.classLoader, isMiuiImeSupport)
+            recordActiveTarget(
+                ActiveTarget(
+                    kind = TARGET_KIND_PACKAGE,
+                    packageName = packageName,
+                    sourceDir = param.applicationInfo.sourceDir
+                )
+            )
+            startHook(packageName, param.classLoader, isMiuiImeSupport, param.applicationInfo.sourceDir)
         }
     }
 
@@ -196,8 +209,21 @@ class MainHook : XposedModule() {
             WeTypeResourceHooks.prepareForHotReload()
         }
         val mainClean = cleanupExternalState()
+        // 剪贴板链路的宿主句柄全绑在旧 ClassLoader 上，且主线程队列里可能还排着持有旧 View
+        // 的回调；必须在主线程上清空，否则补投的回调会在使用新句柄前把旧对象写回缓存。
+        val clipboardClean = runOnMainThreadBlocking {
+            WeTypeHostContracts.prepareForHotReload()
+            WeTypeClipboardHooks.prepareForHotReload()
+            WeTypeClipboardRetentionGuard.prepareForHotReload()
+            WeTypeClipboardImageHost.prepareForHotReload()
+            WeTypeClipboardImageList.prepareForHotReload()
+            WeTypeClipboardImageLoader.prepareForHotReload()
+            WeTypeClipboardImageEntries.prepareForHotReload()
+            // 搜索/瀑布流 Hook 的状态都挂在本模块对象上、随 ClassLoader 一起换代，
+            // 没有 prepareForHotReload；主线程残留回调会被各自的弱引用与代数检查挡住。
+        }
         WeTypeSettings.prepareForHotReload()
-        if (!hostClean || !windowClean || !resourcesClean || !mainClean) {
+        if (!hostClean || !windowClean || !resourcesClean || !mainClean || !clipboardClean) {
             Log.e("Reject hot reload because target-process callbacks could not be fully cleaned")
             return false
         }
@@ -238,7 +264,7 @@ class MainHook : XposedModule() {
                 }
 
                 TARGET_KIND_PACKAGE -> target.packageName?.let { packageName ->
-                    startHook(packageName, classLoader, isMiuiImeSupport)
+                    startHook(packageName, classLoader, isMiuiImeSupport, target.sourceDir)
                     bottomManagersToReconcile += reinstallDynamicBottomManagerHooks(
                         param.oldHookHandles,
                         packageName
@@ -258,12 +284,13 @@ class MainHook : XposedModule() {
     private fun startHook(
         packageName: String,
         classLoader: ClassLoader,
-        isMiuiImeSupport: Boolean
+        isMiuiImeSupport: Boolean,
+        sourceDir: String?
     ) {
         val isWeType = packageName == WETYPE_PACKAGE
 
         if (isWeType) {
-            installWeTypeHooksWhenReady(packageName)
+            installWeTypeHooksWhenReady(packageName, sourceDir)
         }
 
         if (!isMiuiImeSupport) return
@@ -291,7 +318,7 @@ class MainHook : XposedModule() {
         Log.i("Hook MIUI IME Done!")
     }
 
-    private fun installWeTypeHooksWhenReady(sourcePackage: String) {
+    private fun installWeTypeHooksWhenReady(sourcePackage: String, sourceDir: String?) {
         fun install(context: Context) {
             if (context.packageName != sourcePackage) return
             if (!installedHookTokens.add("wetype.application-ready")) return
@@ -299,7 +326,7 @@ class MainHook : XposedModule() {
             // supplied by onPackageReady still resolves the original APK's duplicate classes.
             HookEnvironment.updateClassLoader(context.classLoader)
             WeTypeSettings.ensureHostSnapshot(context)
-            installWeTypeHooks(sourcePackage)
+            installWeTypeHooks(sourcePackage, sourceDir, context.classLoader)
             Log.i("Success: Hook WeType with attached application class loader")
         }
         val application = runCatching {
@@ -323,7 +350,11 @@ class MainHook : XposedModule() {
         }
     }
 
-    private fun installWeTypeHooks(sourcePackage: String) {
+    private fun installWeTypeHooks(
+        sourcePackage: String,
+        sourceDir: String?,
+        hostClassLoader: ClassLoader?
+    ) {
         // Application.attach is not replayed when an already running process hot reloads.
         val application = runCatching {
             Class.forName("android.app.ActivityThread")
@@ -331,6 +362,19 @@ class MainHook : XposedModule() {
                 .invoke(null) as? Context
         }.getOrNull()
         application?.let(WeTypeSettings::ensureHostSnapshot)
+
+        // 剪贴板增强按结构匹配宿主混淆成员，DexKit 扫描与句柄解析都必须用当前进程的
+        // 实际宿主 ClassLoader；Tinker 热修复后它才是能解析到补丁类的那一个。
+        if (sourceDir != null && hostClassLoader != null) {
+            HookEnvironment.withHookScope("wetype.host-contract") {
+                WeTypeHostContracts.install(sourceDir, hostClassLoader)
+            }
+            HookEnvironment.withHookScope("wetype.clipboard") {
+                WeTypeClipboardHooks.install(sourceDir, hostClassLoader)
+            }
+        } else {
+            Log.e("Skip clipboard hooks: missing host sourceDir or class loader")
+        }
 
         HookEnvironment.withHookScope("wetype.activation") { hookActivationHeartbeat(sourcePackage) }
         HookEnvironment.withHookScope("wetype.font") { hookWeTypeFont() }
@@ -346,6 +390,7 @@ class MainHook : XposedModule() {
         HookEnvironment.withHookScope("wetype.window-blur") { hookWeTypeWindowBlur() }
         HookEnvironment.withHookScope("wetype.disable-update") { hookWeTypeDisableHotUpdate() }
         HookEnvironment.withHookScope("wetype.intent-entry") { hookWeTypeIntentEntry() }
+        HookEnvironment.withHookScope("wetype.back-press") { hookHostBackPress() }
         HookEnvironment.withHookScope("wetype.activity-result") { hookWeTypeActivityResultEntry() }
         HookEnvironment.withHookScope("wetype.about-entry") { hookWeTypeAboutLogoEntry() }
         HookEnvironment.withHookScope("wetype.keyboard-logo") { WeTypeResourceHooks.hookKeyboardLogo() }
@@ -902,7 +947,7 @@ class MainHook : XposedModule() {
             }.hookAfter { param ->
                 val activity = param.thisObject as? Activity ?: return@hookAfter
                 val intent = param.args[0] as? Intent ?: return@hookAfter
-                if (intent.getBooleanExtra(EXTRA_OPEN_WETYPE_EMBEDDED_SETTINGS, false)) {
+                if (intent.hasOpenWeTypePageExtra()) {
                     activity.intent = intent
                 }
             }
@@ -911,16 +956,46 @@ class MainHook : XposedModule() {
             }.hookAfter { param ->
                 val activity = param.thisObject as? Activity ?: return@hookAfter
                 val intent = activity.intent ?: return@hookAfter
-                if (!intent.getBooleanExtra(EXTRA_OPEN_WETYPE_EMBEDDED_SETTINGS, false)) return@hookAfter
+                if (!intent.hasOpenWeTypePageExtra()) return@hookAfter
+                val openBackupPage = intent.getBooleanExtra(EXTRA_OPEN_WETYPE_BACKUP_PAGE, false)
                 intent.removeExtra(EXTRA_OPEN_WETYPE_EMBEDDED_SETTINGS)
+                intent.removeExtra(EXTRA_OPEN_WETYPE_BACKUP_PAGE)
                 activity.window?.decorView?.let { decorView ->
                     HookEnvironment.postTracked(decorView) {
-                        WeTypeHostLauncher.show(activity)
+                        if (openBackupPage) {
+                            WeTypeHostLauncher.showBackupPage(activity)
+                        } else {
+                            WeTypeHostLauncher.show(activity)
+                        }
                     }
                 }
             }
         }.onFailure {
             Log.e("Failed:Hook WeType intent entry")
+            Log.i(it)
+        }
+    }
+
+    private fun Intent.hasOpenWeTypePageExtra(): Boolean =
+        getBooleanExtra(EXTRA_OPEN_WETYPE_EMBEDDED_SETTINGS, false) ||
+            getBooleanExtra(EXTRA_OPEN_WETYPE_BACKUP_PAGE, false)
+
+    /**
+     * 备份与恢复页是宿主 Activity 实例，无 OnBackPressedDispatcherOwner；
+     * 任务执行中拦截返回，避免页面销毁后导出/导入状态丢失。
+     */
+    private fun hookHostBackPress() {
+        runCatching {
+            findMethod("android.app.Activity") {
+                name == "onBackPressed" && parameterTypes.isEmpty()
+            }.hookBefore { param ->
+                val activity = param.thisObject as? Activity ?: return@hookBefore
+                if (WeTypeHostLauncher.isBackupPageBusy(activity)) {
+                    param.result = null
+                }
+            }
+        }.onFailure {
+            Log.e("Failed:Hook host back press guard")
             Log.i(it)
         }
     }

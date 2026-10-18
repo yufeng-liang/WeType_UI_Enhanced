@@ -92,6 +92,7 @@
     <string name="settings_save_desc">将当前配置写入模块</string>
     <string name="settings_reset_title">恢复默认</string>
     <string name="settings_reset_desc">重置所有选项为默认值</string>
+    <string name="settings_clipboard_backup_unavailable">无法打开剪贴板备份页</string>
     <string name="settings_restart_title">重启 WeType</string>
     <string name="settings_restart_desc">重启输入法以应用更改</string>
     <string name="settings_visit_github_title">前往 GitHub</string>

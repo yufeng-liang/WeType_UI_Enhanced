@@ -57,6 +57,7 @@ kotlin {
 
 dependencies {
     testImplementation("junit:junit:4.13.2")
+    // 上游 HostPreferencesFileTest 在 JVM 单测需要 XmlPullParser 实现
     testImplementation("net.sf.kxml:kxml2:2.3.0")
     compileOnly("io.github.libxposed:api:102.0.0")
     implementation("io.github.libxposed:service:102.0.0")
@@ -74,4 +75,6 @@ dependencies {
     }
     implementation("io.github.kyant0:capsule:2.1.3")
     implementation("org.luckypray:dexkit:2.3.0")
+    // 剪贴板搜索：TinyPinyin 轻量拼音（原坐标 com.github.promeg:tinypinyin:2.0.3 已不可用，改用同源 MavenCentral 坐标）
+    implementation("io.github.biezhi:TinyPinyin:2.0.3.RELEASE")
 }
