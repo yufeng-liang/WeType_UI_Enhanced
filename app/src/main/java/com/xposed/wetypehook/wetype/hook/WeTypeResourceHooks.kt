@@ -32,6 +32,7 @@ import java.lang.reflect.Method
 import java.lang.reflect.Modifier
 import java.util.Collections
 import java.util.WeakHashMap
+import java.util.concurrent.ConcurrentHashMap
 import kotlin.math.roundToInt
 
 internal object WeTypeResourceHooks {
@@ -62,8 +63,13 @@ internal object WeTypeResourceHooks {
     private val typedArrayAttributeCache = Collections.synchronizedMap(
         WeakHashMap<TypedArray, IntArray>()
     )
+    /** recycle hook 的短路标志：尚未写入任何条目时，宿主每次样式解析的 recycle 免进同步表 */
+    @Volatile
+    private var typedArraysTracked = false
+    // 内层改用 ConcurrentHashMap：热路径（按键/主题属性判定）读写免手动加锁，
+    // 外层 WeakHashMap 仍需同步（弱表并发读不安全），但每 Resources 只剩一次锁。
     private val resourcePackageCache = Collections.synchronizedMap(
-        WeakHashMap<Resources, MutableMap<Int, Boolean>>()
+        WeakHashMap<Resources, ConcurrentHashMap<Int, Boolean>>()
     )
     private data class CandidatePinyinListeners(
         val layout: View.OnLayoutChangeListener,
@@ -1272,8 +1278,14 @@ internal object WeTypeResourceHooks {
     ) {
         // TypedArray instances return to a Resources pool; weak keys alone do not
         // prevent an old attribute mapping from leaking into the next borrower.
+        // 短路标志的时序约定：写入端先 put 再置 true，清理端在同一把锁内
+        // remove 后判空才置 false，保证标志为 false 时表必为空。
         TypedArray::class.java.getMethod("recycle").hookBefore { param ->
-            typedArrayAttributeCache.remove(param.thisObject)
+            if (!typedArraysTracked) return@hookBefore
+            synchronized(typedArrayAttributeCache) {
+                typedArrayAttributeCache.remove(param.thisObject)
+                if (typedArrayAttributeCache.isEmpty()) typedArraysTracked = false
+            }
         }
         runCatching {
             Resources.Theme::class.java.getMethod("obtainStyledAttributes", IntArray::class.java)
@@ -1283,7 +1295,7 @@ internal object WeTypeResourceHooks {
                     val typedArray = param.result as? TypedArray ?: return@hookAfter
                     val attrs = param[0] as? IntArray ?: return@hookAfter
                     if (!containsTargetWeTypeThemeAttr(resources, attrs, resolvedThemeAttrs)) return@hookAfter
-                    typedArrayAttributeCache[typedArray] = attrs.copyOf()
+                    trackTypedArrayAttributes(typedArray, attrs)
                 }
         }
         runCatching {
@@ -1297,7 +1309,7 @@ internal object WeTypeResourceHooks {
                 val typedArray = param.result as? TypedArray ?: return@hookAfter
                 val attrs = param[1] as? IntArray ?: return@hookAfter
                 if (!containsTargetWeTypeThemeAttr(resources, attrs, resolvedThemeAttrs)) return@hookAfter
-                typedArrayAttributeCache[typedArray] = attrs.copyOf()
+                trackTypedArrayAttributes(typedArray, attrs)
             }
         }
         runCatching {
@@ -1313,9 +1325,15 @@ internal object WeTypeResourceHooks {
                 val typedArray = param.result as? TypedArray ?: return@hookAfter
                 val attrs = param[1] as? IntArray ?: return@hookAfter
                 if (!containsTargetWeTypeThemeAttr(resources, attrs, resolvedThemeAttrs)) return@hookAfter
-                typedArrayAttributeCache[typedArray] = attrs.copyOf()
+                trackTypedArrayAttributes(typedArray, attrs)
             }
         }
+    }
+
+    private fun trackTypedArrayAttributes(typedArray: TypedArray, attrs: IntArray) {
+        typedArrayAttributeCache[typedArray] = attrs.copyOf()
+        // 必须在 put 落地之后置 true（见 recycle hook 处的时序说明）
+        typedArraysTracked = true
     }
 
     private fun replaceThemeAttributeTypedValue(
@@ -1452,18 +1470,14 @@ internal object WeTypeResourceHooks {
     private fun isWeTypeResource(resources: Resources, resId: Int): Boolean {
         if (resId == 0) return false
         val cache = synchronized(resourcePackageCache) {
-            resourcePackageCache.getOrPut(resources) { mutableMapOf() }
+            resourcePackageCache.getOrPut(resources) { ConcurrentHashMap() }
         }
-        synchronized(cache) {
-            cache[resId]
-        }?.let { return it }
+        cache[resId]?.let { return it }
 
         val isWeTypeResource = runCatching {
             resources.getResourcePackageName(resId) == WETYPE_RESOURCE_PACKAGE
         }.getOrDefault(false)
-        synchronized(cache) {
-            cache[resId] = isWeTypeResource
-        }
+        cache[resId] = isWeTypeResource
         return isWeTypeResource
     }
 

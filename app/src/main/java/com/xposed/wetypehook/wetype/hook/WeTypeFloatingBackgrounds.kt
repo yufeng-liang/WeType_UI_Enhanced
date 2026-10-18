@@ -8,6 +8,7 @@ import android.graphics.drawable.Drawable
 import android.graphics.drawable.NinePatchDrawable
 import android.view.View
 import android.view.ViewGroup
+import android.view.ViewParent
 import android.view.ViewTreeObserver
 import android.widget.ImageView
 import android.widget.PopupWindow
@@ -30,8 +31,13 @@ private const val KEYBOARD_CLASS_PREFIX = "com.tencent.wetype.plugin.hld.keyboar
 internal object WeTypeFloatingBackgrounds {
     private data class FloatingGeometry(val bounds: Rect, val radius: Float)
 
-    private class SuppressedBackground(view: View, var original: Drawable) {
-        val viewReference = WeakReference(view)
+    /** 每帧复用的九宫格外框缓存：命中时跳过 setBounds/getOutline 的原生路径探测 */
+    private class DrawableGeometryCache {
+        var drawable: Drawable? = null
+        var width = -1
+        var height = -1
+        var localBounds: Rect? = null
+        var radius = 0f
     }
 
     private class FloatingFrame(
@@ -48,7 +54,12 @@ internal object WeTypeFloatingBackgrounds {
         var originalEditImage: Drawable? = editBackground.drawable
         var resizeHandles: WeTypeFloatingResizeHandlesDrawable? = null
         val contentReference = WeakReference(content)
-        val suppressedBackgrounds = mutableListOf<SuppressedBackground>()
+        /** 已压制背景的目标视图表：键即目标（弱引用，视图回收后条目自动清理），值为原始背景 */
+        val suppressedBackgrounds = WeakHashMap<View, Drawable>()
+        /** normalBackground 的九宫格外框缓存 */
+        val normalGeometryCache = DrawableGeometryCache()
+        /** editBackground 的九宫格外框缓存 */
+        val editGeometryCache = DrawableGeometryCache()
         var observer: WeakReference<ViewTreeObserver>? = null
         var preDrawListener: ViewTreeObserver.OnPreDrawListener? = null
         var attachListener: View.OnAttachStateChangeListener? = null
@@ -211,8 +222,8 @@ internal object WeTypeFloatingBackgrounds {
         // Theme resources arrive asynchronously when a popup first attaches. Wait
         // for them rather than briefly painting a differently sized fallback.
         if (normalDrawable == null && frame.originalEditImage == null) return
-        val editGeometry = editBackground?.let { drawableGeometry(it, frame.originalEditImage) }
-        val geometry = drawableGeometry(normalBackground, normalDrawable)
+        val editGeometry = editBackground?.let { drawableGeometry(it, frame.originalEditImage, frame.editGeometryCache) }
+        val geometry = drawableGeometry(normalBackground, normalDrawable, frame.normalGeometryCache)
             ?: editGeometry
             ?: contentGeometry(root, content, frame.radiusGetter) ?: return
         update(root, geometry.bounds, geometry.radius)
@@ -261,40 +272,58 @@ internal object WeTypeFloatingBackgrounds {
         }
     }
 
+    /** 键盘根 → 内容视图缓存；findViewById 是整棵子树遍历，热路径上以父链校验后复用 */
+    private val keyboardContentCache = WeakHashMap<View, View>()
+
+    private fun resolveKeyboardContent(keyboardRoot: View): View? {
+        val id = keyboardContentId ?: return null
+        val cached = keyboardContentCache[keyboardRoot]
+        if (cached != null && isDescendantOf(cached, keyboardRoot)) return cached
+        val resolved = keyboardRoot.findViewById<View>(id) ?: return null
+        keyboardContentCache[keyboardRoot] = resolved
+        return resolved
+    }
+
+    private fun isDescendantOf(view: View, ancestor: View): Boolean {
+        if (view === ancestor) return true
+        var parent: ViewParent? = view.parent
+        while (parent != null) {
+            if (parent === ancestor) return true
+            parent = parent.parent
+        }
+        return false
+    }
+
     private fun suppressContentBackgrounds(content: ViewGroup, frame: FloatingFrame) {
         val targets = linkedSetOf<View>(content)
         fun visit(view: View) {
             if (view.id in backgroundViewIds || view.javaClass.name == FLOATING_CANDIDATE) targets += view
             if (isKeyboardRoot(view)) {
-                keyboardContentId?.let { id -> view.findViewById<View>(id)?.let(targets::add) }
+                resolveKeyboardContent(view)?.let(targets::add)
             }
             if (view is ViewGroup) {
                 for (index in 0 until view.childCount) visit(view.getChildAt(index))
             }
         }
         visit(content)
-        val iterator = frame.suppressedBackgrounds.iterator()
+        // 还原已离开目标集的视图（WeakHashMap 键弱引用，视图回收后条目自动消失）
+        val iterator = frame.suppressedBackgrounds.entries.iterator()
         while (iterator.hasNext()) {
-            val saved = iterator.next()
-            val view = saved.viewReference.get()
-            if (view == null || view !in targets) {
-                restoreBackground(saved)
+            val entry = iterator.next()
+            if (entry.key !in targets) {
+                restoreBackground(entry.key, entry.value)
                 iterator.remove()
             }
         }
         targets.forEach { view ->
             val background = view.background ?: return@forEach
-            val saved = frame.suppressedBackgrounds.firstOrNull { it.viewReference.get() === view }
-            if (saved == null) frame.suppressedBackgrounds += SuppressedBackground(view, background)
-            else saved.original = background
+            frame.suppressedBackgrounds[view] = background
             setBackgroundPreservingPadding(view, null)
         }
     }
 
-    private fun restoreBackground(saved: SuppressedBackground) {
-        saved.viewReference.get()?.let { view ->
-            if (view.background == null) setBackgroundPreservingPadding(view, saved.original)
-        }
+    private fun restoreBackground(view: View, original: Drawable) {
+        if (view.background == null) setBackgroundPreservingPadding(view, original)
     }
 
     private fun restoreSnapshotAlpha(content: ViewGroup) {
@@ -310,16 +339,40 @@ internal object WeTypeFloatingBackgrounds {
         snapshot.invalidate()
     }
 
-    private fun drawableGeometry(image: ImageView, drawable: Drawable?): FloatingGeometry? {
+    private fun drawableGeometry(image: ImageView, drawable: Drawable?, cache: DrawableGeometryCache): FloatingGeometry? {
         // Native nine-patches carry the visible body's optical outline, excluding
         // their transparent shadow margins. A transparent dark-mode ColorDrawable
         // must not be interpreted as a full-root body; the edit image is the fallback.
         if (drawable !is NinePatchDrawable || drawable.alpha <= 0 ||
             image.scaleType != ImageView.ScaleType.FIT_XY
-        ) return null
+        ) {
+            cache.drawable = null
+            cache.localBounds = null
+            return null
+        }
         val width = image.width - image.paddingLeft - image.paddingRight
         val height = image.height - image.paddingTop - image.paddingBottom
-        if (width <= 0 || height <= 0) return null
+        if (width <= 0 || height <= 0) {
+            cache.drawable = null
+            cache.localBounds = null
+            return null
+        }
+        if (cache.drawable !== drawable || cache.width != width || cache.height != height) {
+            cache.drawable = drawable
+            cache.width = width
+            cache.height = height
+            val outline = resolveNinePatchOutline(drawable, width, height)
+            cache.localBounds = outline?.first
+            cache.radius = outline?.second ?: 0f
+        }
+        val localBounds = cache.localBounds ?: return null
+        // 拖动/移动只改变平移量，相对 image 的局部外框可跨帧复用
+        val bounds = Rect(localBounds)
+        bounds.offset(image.left + image.paddingLeft, image.top + image.paddingTop)
+        return FloatingGeometry(bounds, cache.radius)
+    }
+
+    private fun resolveNinePatchOutline(drawable: NinePatchDrawable, width: Int, height: Int): Pair<Rect, Float>? {
         return runCatching {
             val previousBounds = Rect(drawable.bounds)
             val outline = Outline()
@@ -334,8 +387,7 @@ internal object WeTypeFloatingBackgrounds {
             if (!outline.alpha.isFinite() || outline.alpha <= 0f || !outline.getRect(bounds) ||
                 bounds.isEmpty || !radius.isFinite() || radius < 0f
             ) return@runCatching null
-            bounds.offset(image.left + image.paddingLeft, image.top + image.paddingTop)
-            FloatingGeometry(bounds, radius)
+            bounds to radius
         }.getOrNull()
     }
 
@@ -396,8 +448,8 @@ internal object WeTypeFloatingBackgrounds {
             Log.i("Failed: Restore WeType floating background")
             Log.i(it)
         }
-        frame.suppressedBackgrounds.forEach { saved ->
-            runCatching { restoreBackground(saved) }.onFailure {
+        frame.suppressedBackgrounds.entries.toList().forEach { (view, original) ->
+            runCatching { restoreBackground(view, original) }.onFailure {
                 Log.i("Failed: Restore WeType floating content background")
                 Log.i(it)
             }
@@ -419,6 +471,7 @@ internal object WeTypeFloatingBackgrounds {
         frames.clear()
         radiusGetters.clear()
         keyboardClasses.clear()
+        keyboardContentCache.clear()
         backgroundViewIds = emptySet()
         keyboardContentId = null
         updateBackground = null

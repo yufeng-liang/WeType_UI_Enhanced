@@ -48,6 +48,13 @@ internal object WeTypeOverlayCompositor {
 
     private val windows = WeakHashMap<View, WindowFrame>()
     private val drawMasks = Collections.synchronizedMap(WeakHashMap<View, Int>())
+
+    /** 当前是否存在生效遮罩；为 false（常态）时 drawChild 全局 hook 直接放行，免去每帧同步查表 */
+    @Volatile
+    private var masksActive = false
+
+    /** 每帧复用的父节点索引表（id → 父 id，根为 -1），避免每个节点每帧分配 ancestors 列表 */
+    private var parentIds = IntArray(256)
     private val keyboardClasses = WeakHashMap<Class<*>, Boolean>()
     private val settingsContentGetters = WeakHashMap<Class<*>, Method?>()
     private var settingsManager: Any? = null
@@ -70,7 +77,8 @@ internal object WeTypeOverlayCompositor {
             HookEnvironment.registerHook(drawChild, "overlay-composition") { chain ->
                 val child = chain.args[1] as? View
                 val canvas = chain.args[0] as? Canvas
-                val drawingAlpha = child?.let(drawMasks::get)
+                // masksActive 为 false 时跳过同步 map 查找，hook 只付一次 volatile 读
+                val drawingAlpha = if (masksActive) child?.let { drawMasks[it] } else null
                 if (child == null || canvas == null || drawingAlpha == null) {
                     chain.proceed()
                 } else {
@@ -146,9 +154,11 @@ internal object WeTypeOverlayCompositor {
         val layers = mutableListOf<WeTypeLayerSnapshot>()
         val views = mutableMapOf<Int, View>()
         var nextId = 0
-        fun visit(view: View, ancestors: List<Int>, parentRendered: Boolean, settingsOwner: Int?,
+        fun visit(view: View, parentId: Int, parentRendered: Boolean, settingsOwner: Int?,
                   candidateOwner: Int?, parentOpacity: Float, offsetX: Int, offsetY: Int) {
             val id = nextId++
+            if (id >= parentIds.size) parentIds = parentIds.copyOf((id + 1) * 2)
+            parentIds[id] = parentId
             val rendered = parentRendered && view.isAttachedToWindow &&
                 (view.visibility == View.VISIBLE || view.animation?.hasEnded() == false) &&
                 view.alpha > 0f && view.width > 0 && view.height > 0
@@ -181,6 +191,14 @@ internal object WeTypeOverlayCompositor {
                     val content = runCatching { getter?.invoke(view) as? View }.getOrNull()
                     view.alpha * (content?.alpha ?: 1f)
                 } else effectiveOpacity
+                // 仅为角色节点（每帧数量少）构造祖先链；其余节点只写 parentIds 复用表。
+                // 链上节点均为本帧已访问的祖先，不存在读到上一帧的陈旧值。
+                val ancestors = ArrayList<Int>()
+                var ancestorId = parentId
+                while (ancestorId >= 0) {
+                    ancestors.add(ancestorId)
+                    ancestorId = parentIds[ancestorId]
+                }
                 layers += WeTypeLayerSnapshot(
                     id, role, ancestors, rendered, owner, opacity,
                     WeTypeLayerBounds(left, top, left + view.width, top + view.height)
@@ -190,12 +208,27 @@ internal object WeTypeOverlayCompositor {
             if (view is ViewGroup) {
                 // The host's keyboard containers use standard child order. Z is applied
                 // before index, matching the framework's stable preordered child list.
-                (0 until view.childCount).map(view::getChildAt).sortedBy { it.z }.forEach {
-                    visit(it, ancestors + id, rendered, owner, candidate, effectiveOpacity, left, top)
+                val count = view.childCount
+                var allDefaultZ = true
+                for (index in 0 until count) {
+                    if (view.getChildAt(index).z != 0f) {
+                        allDefaultZ = false
+                        break
+                    }
+                }
+                if (allDefaultZ) {
+                    // 快速路径：全部 child 均为默认 z 时索引序即稳定绘制序，免排序与列表分配
+                    for (index in 0 until count) {
+                        visit(view.getChildAt(index), id, rendered, owner, candidate, effectiveOpacity, left, top)
+                    }
+                } else {
+                    (0 until count).map(view::getChildAt).sortedBy { it.z }.forEach {
+                        visit(it, id, rendered, owner, candidate, effectiveOpacity, left, top)
+                    }
                 }
             }
         }
-        visit(decor, emptyList(), decor.isShown, null, null, 1f, 0, 0)
+        visit(decor, -1, decor.isShown, null, null, 1f, 0, 0)
         val toolsRequested = runCatching {
             toolsRequestedGetter?.invoke(settingsManager) as? Boolean
         }.getOrNull()
@@ -208,6 +241,7 @@ internal object WeTypeOverlayCompositor {
         }.toMap()
         (previous.keys - masked.keys).forEach { drawMasks.remove(it) }
         masked.forEach { (view, alpha) -> drawMasks[view] = alpha }
+        masksActive = !drawMasks.isEmpty()
         // Hardware display lists can reuse the old masking command even when only
         // the host's alpha changed. Re-record affected parents when the plan changes.
         (previous.keys + masked.keys).filter { previous[it] != masked[it] }.forEach(::invalidateDrawing)
@@ -260,6 +294,7 @@ internal object WeTypeOverlayCompositor {
             invalidateDrawing(it)
         }
         frame.maskedViews = emptyList()
+        masksActive = !drawMasks.isEmpty()
     }
 
     private fun removeListener(frame: WindowFrame, currentObserver: ViewTreeObserver? = null) {
@@ -289,6 +324,7 @@ internal object WeTypeOverlayCompositor {
         }
         windows.clear()
         drawMasks.clear()
+        masksActive = false
         keyboardClasses.clear()
         settingsContentGetters.clear()
         settingsManager = null

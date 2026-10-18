@@ -673,7 +673,7 @@ internal object WeTypeWindowHooks {
             }
         }
 
-        applyBackgroundSurface(decorGroup, context, state, cornerRadii, bounds.top, backgroundHeight)
+        applyBackgroundSurface(decorGroup, context, state, cornerRadii, bounds.top, backgroundHeight, settings = settings)
     }
 
     private fun applyFloatingBackground(root: ViewGroup, bounds: Rect, radius: Float) {
@@ -704,9 +704,10 @@ internal object WeTypeWindowHooks {
         top: Int,
         height: Int,
         left: Int = 0,
-        width: Int = parent.width
+        width: Int = parent.width,
+        // 调用方已读过快照就直接传入（applyBackgroundCarrier 链）；否则现场读一次
+        settings: WeTypeSettings.Snapshot = WeTypeSettings.readSnapshotXposed()
     ) {
-        val settings = WeTypeSettings.readSnapshotXposed()
         val overrides = if (settings.hyperMaterialEnabled && WeTypeHyperMaterial.areGlassOverridesAvailable()) {
             settings.glassOverrides
         } else GlassMaterialOverrides()
