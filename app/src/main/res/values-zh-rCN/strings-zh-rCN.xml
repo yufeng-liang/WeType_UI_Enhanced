@@ -149,4 +149,39 @@
     <string name="settings_glass_lighten_angle">提亮角域</string>
     <string name="settings_glass_highlight_parameter">高光 · %1$s</string>
     <string name="settings_glass_reset_desc">恢复默认的玻璃、磨砂和高光参数。</string>
+
+    <!-- 剪贴板子页 -->
+    <string name="settings_clipboard_section_basic">基础增强</string>
+    <string name="settings_clipboard_cross_device_title">跨设备条目可见化持久保存</string>
+    <string name="settings_clipboard_cross_device_desc">自动将多端同步的剪贴板远程条目转换为本地可见条目保存</string>
+    <string name="settings_clipboard_retention_title">解除保留上限与时长限制</string>
+    <string name="settings_clipboard_retention_desc">剪贴板保存条数上限提升至 100,000 条，留存时长永久</string>
+    <string name="settings_clipboard_text_limit_title">解除单条文本长度限制</string>
+    <string name="settings_clipboard_text_limit_desc">剪贴板文本长度上限提升至 1 亿字符，抑制超限提示</string>
+    <string name="settings_clipboard_section_search">搜索</string>
+    <string name="settings_clipboard_search_title">剪贴板搜索</string>
+    <string name="settings_clipboard_search_desc">在剪贴板页面显示搜索框，按文本拼音分词过滤</string>
+    <string name="settings_clipboard_search_clear_on_back_title">返回时清理搜索关键词</string>
+    <string name="settings_clipboard_search_clear_on_back_desc">在剪贴板页面点击返回键时清理搜索关键词，恢复完整列表；关闭则保留上次搜索结果</string>
+    <string name="settings_clipboard_section_image">图片缩略图</string>
+    <string name="settings_clipboard_image_adjust_ratio_title">图片缩略图保持原比例</string>
+    <string name="settings_clipboard_image_adjust_ratio_desc">宽度按原图比例缩放，最长不超过行宽；关闭后缩略图统一为正方形</string>
+    <string name="settings_clipboard_image_crop_title">图片缩略图裁剪填满</string>
+    <string name="settings_clipboard_image_crop_desc">在缩略图框内居中裁剪填满，可能裁掉图片边缘；关闭则完整显示</string>
+    <string name="settings_clipboard_image_uniform_row_height_title">图片缩略图统一行高</string>
+    <string name="settings_clipboard_image_uniform_row_height_desc">所有图片条目统一为两行高度；关闭后图片按单行高度显示</string>
+    <string name="settings_clipboard_image_max_count_title">图片数量上限</string>
+    <string name="settings_clipboard_no_limit">无上限</string>
+    <string name="settings_clipboard_image_count_option">%1$d 张</string>
+    <string name="settings_clipboard_image_max_size_title">图片容量上限</string>
+    <string name="settings_clipboard_image_size_gb">%1$d GB</string>
+    <string name="settings_clipboard_image_size_mb">%1$d MB</string>
+    <string name="settings_clipboard_section_layout">排版与布局</string>
+    <string name="settings_clipboard_waterfall_title">剪贴板双列瀑布流</string>
+    <string name="settings_clipboard_waterfall_desc">剪贴板以双列瀑布流展示；卡片超过最大高度时，文本末行显示省略号，图片等比缩放</string>
+    <string name="settings_clipboard_waterfall_max_height_title">卡片最大高度</string>
+    <string name="settings_clipboard_dp_option">%1$d dp</string>
+    <string name="settings_clipboard_section_backup">备份与恢复</string>
+    <string name="settings_clipboard_backup_title">剪贴板备份与恢复</string>
+    <string name="settings_clipboard_backup_desc">导出 zip / WebDAV 备份 / 导入还原</string>
 </resources>

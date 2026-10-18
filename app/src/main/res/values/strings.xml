@@ -149,4 +149,39 @@
     <string name="settings_glass_lighten_angle">Brightening angle</string>
     <string name="settings_glass_highlight_parameter">Highlight · %1$s</string>
     <string name="settings_glass_reset_desc">Restore the default glass, frost, and highlight parameters.</string>
+
+    <!-- Clipboard sub page -->
+    <string name="settings_clipboard_section_basic">Basic enhancements</string>
+    <string name="settings_clipboard_cross_device_title">Persist cross-device entries</string>
+    <string name="settings_clipboard_cross_device_desc">Convert multi-device synced remote clipboard entries into locally visible entries automatically</string>
+    <string name="settings_clipboard_retention_title">Remove retention count and duration limits</string>
+    <string name="settings_clipboard_retention_desc">Raise the clipboard entry limit to 100,000 entries and keep them permanently</string>
+    <string name="settings_clipboard_text_limit_title">Remove per-entry text length limit</string>
+    <string name="settings_clipboard_text_limit_desc">Raise the clipboard text length cap to 100 million characters and suppress the over-limit toast</string>
+    <string name="settings_clipboard_section_search">Search</string>
+    <string name="settings_clipboard_search_title">Clipboard search</string>
+    <string name="settings_clipboard_search_desc">Show a search box on the clipboard page and filter entries by text pinyin</string>
+    <string name="settings_clipboard_search_clear_on_back_title">Clear search keyword on back</string>
+    <string name="settings_clipboard_search_clear_on_back_desc">Clear the search keyword and restore the full list when pressing back on the clipboard page; keep the last results when off</string>
+    <string name="settings_clipboard_section_image">Image thumbnails</string>
+    <string name="settings_clipboard_image_adjust_ratio_title">Keep thumbnail aspect ratio</string>
+    <string name="settings_clipboard_image_adjust_ratio_desc">Scale width by the original aspect ratio, capped at the row width; off shows square thumbnails</string>
+    <string name="settings_clipboard_image_crop_title">Crop thumbnail to fill</string>
+    <string name="settings_clipboard_image_crop_desc">Center-crop to fill the thumbnail frame, possibly trimming image edges; off shows the full image</string>
+    <string name="settings_clipboard_image_uniform_row_height_title">Uniform thumbnail row height</string>
+    <string name="settings_clipboard_image_uniform_row_height_desc">All image entries use a two-line height; off uses a single-line height</string>
+    <string name="settings_clipboard_image_max_count_title">Maximum image count</string>
+    <string name="settings_clipboard_no_limit">No limit</string>
+    <string name="settings_clipboard_image_count_option">%1$d images</string>
+    <string name="settings_clipboard_image_max_size_title">Maximum image size</string>
+    <string name="settings_clipboard_image_size_gb">%1$d GB</string>
+    <string name="settings_clipboard_image_size_mb">%1$d MB</string>
+    <string name="settings_clipboard_section_layout">Layout</string>
+    <string name="settings_clipboard_waterfall_title">Two-column waterfall clipboard</string>
+    <string name="settings_clipboard_waterfall_desc">Show the clipboard as a two-column waterfall; when a card exceeds the maximum height, the last text line is ellipsized and images scale proportionally</string>
+    <string name="settings_clipboard_waterfall_max_height_title">Maximum card height</string>
+    <string name="settings_clipboard_dp_option">%1$d dp</string>
+    <string name="settings_clipboard_section_backup">Backup and restore</string>
+    <string name="settings_clipboard_backup_title">Clipboard backup and restore</string>
+    <string name="settings_clipboard_backup_desc">Export zip / WebDAV backup / import and restore</string>
 </resources>
