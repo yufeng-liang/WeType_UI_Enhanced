@@ -6,6 +6,8 @@ import org.junit.Rule
 import org.junit.Test
 import org.junit.rules.TemporaryFolder
 import java.io.File
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
 
 class HostPreferencesFileTest {
     @get:Rule val temporaryFolder = TemporaryFolder()
@@ -71,7 +73,8 @@ class HostPreferencesFileTest {
         assertEquals(60, reader.read()["blur_radius"])
         val replacement = temporaryFolder.newFile("replacement.xml")
         replacement.writeText("""<map><int name="blur_radius" value="20" /></map>""")
-        check(replacement.renameTo(file))
+        // Windows 上 File.renameTo 不能覆盖已存在的目标文件，用 Files.move 模拟原子替换。
+        Files.move(replacement.toPath(), file.toPath(), StandardCopyOption.REPLACE_EXISTING)
         assertEquals(20, reader.read()["blur_radius"])
     }
 
