@@ -219,6 +219,8 @@ class MainHook : XposedModule() {
             WeTypeClipboardImageList.prepareForHotReload()
             WeTypeClipboardImageLoader.prepareForHotReload()
             WeTypeClipboardImageEntries.prepareForHotReload()
+            // 搜索/瀑布流 Hook 的状态都挂在本模块对象上、随 ClassLoader 一起换代，
+            // 没有 prepareForHotReload；主线程残留回调会被各自的弱引用与代数检查挡住。
         }
         WeTypeSettings.prepareForHotReload()
         if (!hostClean || !windowClean || !resourcesClean || !mainClean || !clipboardClean) {

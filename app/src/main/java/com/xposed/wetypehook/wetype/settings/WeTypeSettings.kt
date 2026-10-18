@@ -46,6 +46,14 @@ object WeTypeSettings {
     const val KEY_CLIPBOARD_IMAGE_MAX_COUNT = "clipboard_image_max_count"
     const val KEY_CLIPBOARD_IMAGE_MAX_SIZE_MB = "clipboard_image_max_size_mb"
 
+    // 剪贴板搜索（Slice 4/5）：开关 + 返回清理关键词。
+    const val KEY_CLIPBOARD_SEARCH = "clipboard_search_enabled"
+    const val KEY_CLIPBOARD_SEARCH_CLEAR_ON_BACK = "clipboard_search_clear_on_back"
+
+    // 剪贴板双列瀑布流：开关 + 卡片最大高度（dp）。
+    const val KEY_CLIPBOARD_WATERFALL_FLOW = "clipboard_waterfall_flow_enabled"
+    const val KEY_CLIPBOARD_WATERFALL_MAX_HEIGHT_DP = "clipboard_waterfall_max_height_dp"
+
     // 剪贴板备份与恢复（独立读写，不进入 Snapshot）。
     const val KEY_BACKUP_LOCAL_FOLDER_URI = "clipboard_backup_local_folder_uri"
     const val KEY_BACKUP_WEBDAV_URL = "clipboard_backup_webdav_url"
@@ -96,6 +104,19 @@ object WeTypeSettings {
     const val CLIPBOARD_IMAGE_MAX_COUNT_LIMIT = 2000
     const val CLIPBOARD_IMAGE_MIN_SIZE_MB = 16
     const val CLIPBOARD_IMAGE_MAX_SIZE_MB_LIMIT = 8192
+
+    // 剪贴板搜索默认开启；返回时默认清理关键词。
+    const val DEFAULT_CLIPBOARD_SEARCH_ENABLED = true
+    const val DEFAULT_CLIPBOARD_SEARCH_CLEAR_ON_BACK = true
+
+    // 瀑布流默认关闭；卡片最大高度默认 140dp，夹在 80~300dp。
+    const val DEFAULT_CLIPBOARD_WATERFALL_FLOW_ENABLED = false
+    const val DEFAULT_CLIPBOARD_WATERFALL_MAX_HEIGHT_DP = 140
+    const val CLIPBOARD_WATERFALL_MIN_HEIGHT_DP = 80
+    const val CLIPBOARD_WATERFALL_MAX_HEIGHT_DP_LIMIT = 300
+
+    fun sanitizeClipboardWaterfallMaxHeightDp(value: Int): Int =
+        value.coerceIn(CLIPBOARD_WATERFALL_MIN_HEIGHT_DP, CLIPBOARD_WATERFALL_MAX_HEIGHT_DP_LIMIT)
 
     fun sanitizeClipboardImageMaxCount(value: Int): Int =
         if (value <= CLIPBOARD_IMAGE_LIMIT_UNLIMITED) {
@@ -150,6 +171,10 @@ object WeTypeSettings {
         val clipboardImageUniformRowHeight: Boolean,
         val clipboardImageMaxCount: Int,
         val clipboardImageMaxSizeMb: Int,
+        val clipboardSearchEnabled: Boolean = DEFAULT_CLIPBOARD_SEARCH_ENABLED,
+        val clipboardSearchClearOnBack: Boolean = DEFAULT_CLIPBOARD_SEARCH_CLEAR_ON_BACK,
+        val clipboardWaterfallFlowEnabled: Boolean = DEFAULT_CLIPBOARD_WATERFALL_FLOW_ENABLED,
+        val clipboardWaterfallMaxHeightDp: Int = DEFAULT_CLIPBOARD_WATERFALL_MAX_HEIGHT_DP,
         val glassOverrides: GlassMaterialOverrides = GlassMaterialOverrides()
     )
 
@@ -244,6 +269,10 @@ object WeTypeSettings {
         clipboardImageUniformRowHeight: Boolean,
         clipboardImageMaxCount: Int,
         clipboardImageMaxSizeMb: Int,
+        clipboardSearchEnabled: Boolean = DEFAULT_CLIPBOARD_SEARCH_ENABLED,
+        clipboardSearchClearOnBack: Boolean = DEFAULT_CLIPBOARD_SEARCH_CLEAR_ON_BACK,
+        clipboardWaterfallFlowEnabled: Boolean = DEFAULT_CLIPBOARD_WATERFALL_FLOW_ENABLED,
+        clipboardWaterfallMaxHeightDp: Int = DEFAULT_CLIPBOARD_WATERFALL_MAX_HEIGHT_DP,
         onPersisted: (Boolean) -> Unit = {}
     ): Boolean {
         val snapshot = Snapshot(
@@ -277,6 +306,12 @@ object WeTypeSettings {
             clipboardImageUniformRowHeight = clipboardImageUniformRowHeight,
             clipboardImageMaxCount = sanitizeClipboardImageMaxCount(clipboardImageMaxCount),
             clipboardImageMaxSizeMb = sanitizeClipboardImageMaxSizeMb(clipboardImageMaxSizeMb),
+            clipboardSearchEnabled = clipboardSearchEnabled,
+            clipboardSearchClearOnBack = clipboardSearchClearOnBack,
+            clipboardWaterfallFlowEnabled = clipboardWaterfallFlowEnabled,
+            clipboardWaterfallMaxHeightDp = sanitizeClipboardWaterfallMaxHeightDp(
+                clipboardWaterfallMaxHeightDp
+            ),
             glassOverrides = glassOverrides
         )
         val appContext = context.applicationContext ?: context
@@ -366,6 +401,17 @@ object WeTypeSettings {
     fun getClipboardImageMaxCountXposed(): Int = readSnapshotXposed().clipboardImageMaxCount
 
     fun getClipboardImageMaxSizeMbXposed(): Int = readSnapshotXposed().clipboardImageMaxSizeMb
+
+    fun isClipboardSearchEnabledXposed(): Boolean = readSnapshotXposed().clipboardSearchEnabled
+
+    fun isClipboardSearchClearOnBackXposed(): Boolean =
+        readSnapshotXposed().clipboardSearchClearOnBack
+
+    fun isClipboardWaterfallFlowEnabledXposed(): Boolean =
+        readSnapshotXposed().clipboardWaterfallFlowEnabled
+
+    fun getClipboardWaterfallMaxHeightDpXposed(): Int =
+        readSnapshotXposed().clipboardWaterfallMaxHeightDp
 
     fun readClipboardBackupSettings(context: Context): ClipboardBackupSettings {
         val preferences = appPreferences(context)
@@ -491,6 +537,13 @@ object WeTypeSettings {
             )
             .putInt(KEY_CLIPBOARD_IMAGE_MAX_COUNT, snapshot.clipboardImageMaxCount)
             .putInt(KEY_CLIPBOARD_IMAGE_MAX_SIZE_MB, snapshot.clipboardImageMaxSizeMb)
+            .putBoolean(KEY_CLIPBOARD_SEARCH, snapshot.clipboardSearchEnabled)
+            .putBoolean(KEY_CLIPBOARD_SEARCH_CLEAR_ON_BACK, snapshot.clipboardSearchClearOnBack)
+            .putBoolean(KEY_CLIPBOARD_WATERFALL_FLOW, snapshot.clipboardWaterfallFlowEnabled)
+            .putInt(
+                KEY_CLIPBOARD_WATERFALL_MAX_HEIGHT_DP,
+                snapshot.clipboardWaterfallMaxHeightDp
+            )
             .putBoolean(KEY_KEY_OPACITY_MIGRATED, true)
             .remove(KEY_KEY_OPACITY)
         fun writeFloatParameters(key: String, values: List<Float>?, maxCount: Int) {
@@ -613,6 +666,24 @@ object WeTypeSettings {
             ),
             clipboardImageMaxSizeMb = sanitizeClipboardImageMaxSizeMb(
                 getInt(KEY_CLIPBOARD_IMAGE_MAX_SIZE_MB, DEFAULT_CLIPBOARD_IMAGE_MAX_SIZE_MB)
+            ),
+            clipboardSearchEnabled = getBoolean(
+                KEY_CLIPBOARD_SEARCH,
+                DEFAULT_CLIPBOARD_SEARCH_ENABLED
+            ),
+            clipboardSearchClearOnBack = getBoolean(
+                KEY_CLIPBOARD_SEARCH_CLEAR_ON_BACK,
+                DEFAULT_CLIPBOARD_SEARCH_CLEAR_ON_BACK
+            ),
+            clipboardWaterfallFlowEnabled = getBoolean(
+                KEY_CLIPBOARD_WATERFALL_FLOW,
+                DEFAULT_CLIPBOARD_WATERFALL_FLOW_ENABLED
+            ),
+            clipboardWaterfallMaxHeightDp = sanitizeClipboardWaterfallMaxHeightDp(
+                getInt(
+                    KEY_CLIPBOARD_WATERFALL_MAX_HEIGHT_DP,
+                    DEFAULT_CLIPBOARD_WATERFALL_MAX_HEIGHT_DP
+                )
             )
         )
     }
@@ -661,7 +732,11 @@ object WeTypeSettings {
         clipboardImageCrop = DEFAULT_CLIPBOARD_IMAGE_CROP,
         clipboardImageUniformRowHeight = DEFAULT_CLIPBOARD_IMAGE_UNIFORM_ROW_HEIGHT,
         clipboardImageMaxCount = DEFAULT_CLIPBOARD_IMAGE_MAX_COUNT,
-        clipboardImageMaxSizeMb = DEFAULT_CLIPBOARD_IMAGE_MAX_SIZE_MB
+        clipboardImageMaxSizeMb = DEFAULT_CLIPBOARD_IMAGE_MAX_SIZE_MB,
+        clipboardSearchEnabled = DEFAULT_CLIPBOARD_SEARCH_ENABLED,
+        clipboardSearchClearOnBack = DEFAULT_CLIPBOARD_SEARCH_CLEAR_ON_BACK,
+        clipboardWaterfallFlowEnabled = DEFAULT_CLIPBOARD_WATERFALL_FLOW_ENABLED,
+        clipboardWaterfallMaxHeightDp = DEFAULT_CLIPBOARD_WATERFALL_MAX_HEIGHT_DP
     )
 
 }

@@ -551,6 +551,18 @@ private fun WeTypeSettingsScreen(
     var clipboardImageMaxSizeMb by rememberSaveable {
         mutableIntStateOf(snapshot.clipboardImageMaxSizeMb)
     }
+    var clipboardSearchEnabled by rememberSaveable {
+        mutableStateOf(snapshot.clipboardSearchEnabled)
+    }
+    var clipboardSearchClearOnBack by rememberSaveable {
+        mutableStateOf(snapshot.clipboardSearchClearOnBack)
+    }
+    var clipboardWaterfallFlowEnabled by rememberSaveable {
+        mutableStateOf(snapshot.clipboardWaterfallFlowEnabled)
+    }
+    var clipboardWaterfallMaxHeightDp by rememberSaveable {
+        mutableIntStateOf(snapshot.clipboardWaterfallMaxHeightDp)
+    }
     val appearanceGroupColors = rememberSaveable(
         saver = listSaver(
             save = { it.toList() },
@@ -640,6 +652,10 @@ private fun WeTypeSettingsScreen(
             clipboardImageUniformRowHeight = clipboardImageUniformRowHeight,
             clipboardImageMaxCount = clipboardImageMaxCount,
             clipboardImageMaxSizeMb = clipboardImageMaxSizeMb,
+            clipboardSearchEnabled = clipboardSearchEnabled,
+            clipboardSearchClearOnBack = clipboardSearchClearOnBack,
+            clipboardWaterfallFlowEnabled = clipboardWaterfallFlowEnabled,
+            clipboardWaterfallMaxHeightDp = clipboardWaterfallMaxHeightDp,
             onPersisted = { saved ->
                 Toast.makeText(
                     context,
@@ -670,6 +686,10 @@ private fun WeTypeSettingsScreen(
         customIconPath = WeTypeSettings.DEFAULT_CUSTOM_ICON_PATH
         iconScale = WeTypeSettings.DEFAULT_ICON_SCALE
         disableHotUpdate = WeTypeSettings.DEFAULT_DISABLE_HOT_UPDATE
+        clipboardSearchEnabled = WeTypeSettings.DEFAULT_CLIPBOARD_SEARCH_ENABLED
+        clipboardSearchClearOnBack = WeTypeSettings.DEFAULT_CLIPBOARD_SEARCH_CLEAR_ON_BACK
+        clipboardWaterfallFlowEnabled = WeTypeSettings.DEFAULT_CLIPBOARD_WATERFALL_FLOW_ENABLED
+        clipboardWaterfallMaxHeightDp = WeTypeSettings.DEFAULT_CLIPBOARD_WATERFALL_MAX_HEIGHT_DP
         appearanceGroups.forEachIndexed { index, group ->
             appearanceGroupColors[index] = group.defaultColor
         }
@@ -1079,6 +1099,14 @@ private fun WeTypeSettingsScreen(
                 onClipboardImageMaxCountChange = { clipboardImageMaxCount = it },
                 clipboardImageMaxSizeMb = clipboardImageMaxSizeMb,
                 onClipboardImageMaxSizeMbChange = { clipboardImageMaxSizeMb = it },
+                clipboardSearchEnabled = clipboardSearchEnabled,
+                onClipboardSearchEnabledChange = { clipboardSearchEnabled = it },
+                clipboardSearchClearOnBack = clipboardSearchClearOnBack,
+                onClipboardSearchClearOnBackChange = { clipboardSearchClearOnBack = it },
+                clipboardWaterfallFlowEnabled = clipboardWaterfallFlowEnabled,
+                onClipboardWaterfallFlowEnabledChange = { clipboardWaterfallFlowEnabled = it },
+                clipboardWaterfallMaxHeightDp = clipboardWaterfallMaxHeightDp,
+                onClipboardWaterfallMaxHeightDpChange = { clipboardWaterfallMaxHeightDp = it },
                 onOpenClipboardBackup = {
                     if (!WeTypeHostLauncher.launchBackupPage(hostActivity)) {
                         Toast.makeText(
