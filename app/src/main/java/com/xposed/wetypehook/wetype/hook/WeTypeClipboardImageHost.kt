@@ -1,10 +1,12 @@
 package com.xposed.wetypehook.wetype.hook
 
 import android.os.Bundle
+import android.os.Parcelable
 import android.util.Log as AndroidLog
 import android.view.View
 import android.view.ViewGroup
 import android.view.ViewTreeObserver
+import android.view.ViewParent
 import com.xposed.wetypehook.wetype.host.HostContractId
 import com.xposed.wetypehook.wetype.host.HostResources
 import com.xposed.wetypehook.wetype.host.WeTypeHostContracts
@@ -15,6 +17,7 @@ import com.xposed.wetypehook.xposed.hookBefore
 import java.lang.reflect.Field
 import java.lang.reflect.Method
 import java.lang.reflect.Modifier
+import java.lang.ref.WeakReference
 import java.util.concurrent.ConcurrentHashMap
 
 /**
@@ -220,8 +223,10 @@ internal object WeTypeClipboardImageHost {
     /**
      * 图片预览页（S33）走宿主 `keyboard.l#B0` 作为左上角“收回”。
      * 模块是直接用 `N.n3(ImagePreview, Bundle)` 切页的，不在宿主页面栈里，
-     * 原生收回会落到普通键盘。这里拦截 S33 的收回并手动导航回剪贴板面板，
-     * 由于剪贴板页只是被隐藏、未被销毁，返回后保留原滚动位置。
+     * 原生收回会落到普通键盘。这里拦截 S33 的收回并手动导航回剪贴板面板。
+     *
+     * 注意：宿主切回面板时会把列表滚动重置到顶部（实测 m00559），页面未销毁并不等于
+     * 滚动位置还在——所以面板重开后要调 [scheduleScrollRestore] 恢复原滚动位置。
      */
     private fun hookImagePreviewBack(classLoader: ClassLoader) {
         val previewClass = resolvePreviewKeyboard(classLoader) ?: run {
@@ -241,6 +246,7 @@ internal object WeTypeClipboardImageHost {
             val self = param.thisObject ?: return@hookBefore
             if (!previewClass.isInstance(self)) return@hookBefore
             if (openClipboardPanel()) {
+                scheduleScrollRestore()
                 AndroidLog.i(TAG, "image preview back -> clipboard panel")
                 param.result = null
             }
@@ -537,6 +543,18 @@ internal object WeTypeClipboardImageHost {
                 runCatching { Class.forName(PREVIEW_KEYBOARD_CLASS, false, it) }.getOrNull()
             }
 
+    /**
+     * 打开图片预览页（带滚动锚点）。
+     *
+     * 在跳转预览前先把锚点所在的剪贴板列表 RecyclerView 滚动状态存起来，
+     * 返回剪贴板面板时由 [scheduleScrollRestore] 恢复到原位置（m00559）。
+     * [anchor] 传 null 时等价于旧签名（不保存滚动，保持旧行为）。
+     */
+    fun openImagePreview(item: Any, anchor: View?): Boolean {
+        saveClipboardScrollState(anchor)
+        return openImagePreview(item)
+    }
+
     fun openImagePreview(item: Any): Boolean {
         return try {
             ensureRuntime()
@@ -551,6 +569,117 @@ internal object WeTypeClipboardImageHost {
             AndroidLog.e(TAG, "open image preview failed: ${t.message}")
             false
         }
+    }
+
+    // ---- 剪贴板列表滚动位置保存/恢复（m00559：预览返回后不再回到列表顶部）----
+
+    /**
+     * 待恢复的滚动状态。
+     *
+     * [rv] 用弱引用持有，避免面板重建时把旧列表 View 钉在内存里；
+     * [itemCount] 是保存时的条目数，恢复前校验数据未变，变了就放弃恢复（保持顶部，
+     * 宁可保守也不跳到错误位置）。宿主切面板用的是同一个 RecyclerView 实例，弱引用
+     * 在正常返回路径上一定还活着。
+     */
+    private class PendingScrollRestore(
+        val rv: WeakReference<View>,
+        val state: Parcelable,
+        val itemCount: Int
+    )
+
+    /** 剪贴板列表的 RecyclerView 二进制名（库真实类名，不是宿主 R8 产物，可安全比对）。 */
+    private const val RECYCLER_VIEW_CLASS = "androidx.recyclerview.widget.RecyclerView"
+
+    /** 待恢复的滚动状态；同一时刻最多一份（重复进预览会覆盖旧的）。 */
+    private var pendingScrollRestore: PendingScrollRestore? = null
+
+    /**
+     * 保存锚点所在剪贴板列表的滚动状态。
+     *
+     * 沿父链找 RecyclerView（按类名比对——模块没有 androidx.recyclerview 编译依赖，
+     * 且宿主 R8 只改内部类名，`androidx.recyclerview.widget.RecyclerView` 本名不变）。
+     * RecyclerView 把 `onSaveInstanceState()` 覆写为 public 并把 LayoutManager 滚动
+     * 位置打进返回的 Parcelable；但模块编译期只有 android.view.View 类型（那里它是
+     * protected），所以走反射。这两个方法 override 的是框架 View 的方法，R8 不会改名
+     * （改了就破坏多态分发），按名字找是安全的。
+     */
+    private fun saveClipboardScrollState(anchor: View?) {
+        if (anchor == null) return
+        pendingScrollRestore = null
+        runCatching {
+            var parent: ViewParent? = anchor.parent
+            while (parent != null) {
+                if (parent.javaClass.name == RECYCLER_VIEW_CLASS) {
+                    val rv = parent as? View ?: return
+                    val state = rv.javaClass.getMethod("onSaveInstanceState")
+                        .invoke(rv) as? Parcelable ?: return
+                    val count = recyclerViewItemCount(rv)
+                    if (count > 0) {
+                        pendingScrollRestore =
+                            PendingScrollRestore(WeakReference(rv), state, count)
+                        AndroidLog.i(TAG, "saved clipboard scroll state (itemCount=$count)")
+                    }
+                    return
+                }
+                parent = parent.parent
+            }
+        }.onFailure { AndroidLog.w(TAG, "save clipboard scroll state failed: ${it.message}") }
+    }
+
+    /**
+     * 恢复保存的滚动位置（预览返回、剪贴板面板重新打开后调用）。
+     *
+     * 时序：宿主切回面板时会重置列表滚动，所以不能立即恢复——挂一次性
+     * OnLayoutChangeListener，等列表真正布局出内容（isShown 且有宽度）后再在
+     * 下一个消息循环里恢复，绕开宿主在布局后同步执行的 scrollToPosition(0)。
+     */
+    private fun scheduleScrollRestore() {
+        val pending = pendingScrollRestore ?: return
+        val rv = pending.rv.get() ?: run {
+            pendingScrollRestore = null
+            return
+        }
+        pendingScrollRestore = null
+        rv.addOnLayoutChangeListener(object : View.OnLayoutChangeListener {
+            override fun onLayoutChange(
+                v: View, left: Int, top: Int, right: Int, bottom: Int,
+                oldLeft: Int, oldTop: Int, oldRight: Int, oldBottom: Int
+            ) {
+                v.removeOnLayoutChangeListener(this)
+                if (!v.isShown || v.width <= 0) return
+                v.post {
+                    runCatching {
+                        // 数据变了（条目数不同）就不恢复，宁可停在顶部也不跳错位置
+                        if (recyclerViewItemCount(rv) != pending.itemCount) {
+                            AndroidLog.i(TAG, "skip scroll restore: item count changed")
+                            return@post
+                        }
+                        // 同 saveClipboardScrollState 的理由走反射（View 上是 protected）
+                        rv.javaClass
+                            .getMethod("onRestoreInstanceState", Parcelable::class.java)
+                            .invoke(rv, pending.state)
+                        AndroidLog.i(TAG, "restored clipboard scroll position")
+                    }.onFailure {
+                        AndroidLog.w(TAG, "restore clipboard scroll failed: ${it.message}")
+                    }
+                }
+            }
+        })
+    }
+
+    /**
+     * 反射取 RecyclerView 的条目数。
+     *
+     * `getAdapter`/`getItemCount` 按名字找：当前宿主版未对它们改名（refreshItem 里
+     * `notifyItemChanged` 同样按名调用成功）；将来若改名导致取不到，返回 -1，
+     * 调用方以 `count > 0` / `count != pending.itemCount` 判断自然降级（不保存/不恢复）。
+     */
+    private fun recyclerViewItemCount(rv: View): Int {
+        return runCatching {
+            val adapter = rv.javaClass.getMethod("getAdapter").invoke(rv) ?: return -1
+            val count = adapter.javaClass.getMethod("getItemCount").invoke(adapter) as? Int
+            count ?: -1
+        }.getOrDefault(-1)
     }
 
     /** 用宿主原生导航切回剪贴板面板（与搜索提交 `N#o3(CustomPhraseAndClipboard, …)` 同契约）。 */

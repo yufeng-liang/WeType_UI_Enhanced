@@ -201,7 +201,7 @@ internal object WeTypeClipboardImageEntries {
                 val bound = boundItemByHolder[holder] ?: return@setOnClickListener
                 if (WeTypeClipboardImageHost.itemType(bound) != 1L) return@setOnClickListener
                 view.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
-                WeTypeClipboardImageHost.openImagePreview(bound)
+                WeTypeClipboardImageHost.openImagePreview(bound, view)
             }
         }
         val attached = runCatching {
@@ -235,7 +235,7 @@ internal object WeTypeClipboardImageEntries {
                 val bound = boundItemByHolder[holder] ?: return@setOnClickListener
                 if (WeTypeClipboardImageHost.itemType(bound) != 1L) return@setOnClickListener
                 view.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
-                WeTypeClipboardImageHost.openImagePreview(bound)
+                WeTypeClipboardImageHost.openImagePreview(bound, view)
             }
         }
         val lp = buildLayoutParams(parent, overlay).apply {
@@ -522,7 +522,7 @@ internal object WeTypeClipboardImageEntries {
                                 WeTypeClipboardImageList.reapplyAll()
                             }
                         }
-                        WeTypeClipboardImageHost.openImagePreview(item)
+                        WeTypeClipboardImageHost.openImagePreview(item, clicked)
                         param.result = null
                     } catch (t: Throwable) {
                         AndroidLog.e(TAG, "image click dispatch failed: ${t.message}")
