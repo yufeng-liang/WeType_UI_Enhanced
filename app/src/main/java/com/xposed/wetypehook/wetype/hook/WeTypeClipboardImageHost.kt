@@ -1,8 +1,10 @@
 package com.xposed.wetypehook.wetype.hook
 
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.os.Parcelable
-import android.util.Log as AndroidLog
+import android.os.SystemClock
 import android.view.View
 import android.view.ViewGroup
 import android.view.ViewTreeObserver
@@ -206,16 +208,16 @@ internal object WeTypeClipboardImageHost {
                 ?: throw ClassNotFoundException(CLIPBOARD_ITEM_CLASS)
             resolveIds(classLoader)
             runCatching { hookImagePreviewBack(classLoader) }
-                .onFailure { AndroidLog.e(TAG, "image preview back hook failed: ${it.message}") }
+                .onFailure { XLog.e("[$TAG] image preview back hook failed: ${it.message}") }
             runCatching { hookImagePreviewSaveAction(classLoader) }
-                .onFailure { AndroidLog.e(TAG, "image preview save hook failed: ${it.message}") }
+                .onFailure { XLog.e("[$TAG] image preview save hook failed: ${it.message}") }
             runCatching { hookPreviewBackdrop(classLoader) }
-                .onFailure { AndroidLog.e(TAG, "image preview backdrop hook failed: ${it.message}") }
+                .onFailure { XLog.e("[$TAG] image preview backdrop hook failed: ${it.message}") }
             installed = true
-            AndroidLog.i(TAG, "image host handles installed (line1=$line1HeightRes line2=$line2HeightRes)")
+            XLog.i("[$TAG] image host handles installed (line1=$line1HeightRes line2=$line2HeightRes)")
             true
         } catch (t: Throwable) {
-            AndroidLog.e(TAG, "image host handles unavailable: ${t.message}")
+            XLog.e("[$TAG] image host handles unavailable: ${t.message}")
             false
         }
     }
@@ -230,7 +232,7 @@ internal object WeTypeClipboardImageHost {
      */
     private fun hookImagePreviewBack(classLoader: ClassLoader) {
         val previewClass = resolvePreviewKeyboard(classLoader) ?: run {
-            AndroidLog.e(TAG, "image preview keyboard class missing")
+            XLog.e("[$TAG] image preview keyboard class missing")
             return
         }
         val baseClass = resolvePreviewHost(classLoader)
@@ -238,7 +240,7 @@ internal object WeTypeClipboardImageHost {
         val backMethod = pickHostMethod(baseClass, "B0") {
             it.parameterTypes.isEmpty() && it.returnType == Void.TYPE
         } ?: run {
-            AndroidLog.e(TAG, "image preview back method missing (keyboard.l#B0)")
+            XLog.e("[$TAG] image preview back method missing (keyboard.l#B0)")
             return
         }
         backMethod.isAccessible = true
@@ -247,11 +249,11 @@ internal object WeTypeClipboardImageHost {
             if (!previewClass.isInstance(self)) return@hookBefore
             if (openClipboardPanel()) {
                 scheduleScrollRestore()
-                AndroidLog.i(TAG, "image preview back -> clipboard panel")
+                XLog.i("[$TAG] image preview back -> clipboard panel")
                 param.result = null
             }
         }
-        AndroidLog.i(TAG, "hooked image preview back (keyboard.l#B0)")
+        XLog.i("[$TAG] hooked image preview back (keyboard.l#B0)")
     }
 
     /**
@@ -273,7 +275,7 @@ internal object WeTypeClipboardImageHost {
                 it.parameterTypes[1] == String::class.java &&
                 it.parameterTypes[2] == Boolean::class.javaPrimitiveType
         } ?: run {
-            AndroidLog.e(TAG, "image preview card bind method missing (keyboard.k#e)")
+            XLog.e("[$TAG] image preview card bind method missing (keyboard.k#e)")
             return
         }
         val refreshMethod = pickHostMethod(cardClass, "c") {
@@ -281,7 +283,7 @@ internal object WeTypeClipboardImageHost {
                 it.parameterTypes.size == 1 &&
                 it.parameterTypes[0] == Boolean::class.javaPrimitiveType
         } ?: run {
-            AndroidLog.e(TAG, "image preview card refresh method missing (keyboard.k#c)")
+            XLog.e("[$TAG] image preview card refresh method missing (keyboard.k#c)")
             return
         }
         bindMethod.isAccessible = true
@@ -291,9 +293,9 @@ internal object WeTypeClipboardImageHost {
             // 本机图片与同步图片统一按远端样式刷新：宿主对本地文件会隐藏
             // 「保存到相册」，但剪贴板里的图片并不在系统相册中，保存入口应当保留。
             runCatching { refreshMethod.invoke(param.thisObject, false) }
-                .onFailure { AndroidLog.e(TAG, "restore image save action failed: ${it.message}") }
+                .onFailure { XLog.e("[$TAG] restore image save action failed: ${it.message}") }
         }
-        AndroidLog.i(TAG, "hooked image preview save action (keyboard.k#e)")
+        XLog.i("[$TAG] hooked image preview save action (keyboard.k#e)")
     }
 
     /**
@@ -387,13 +389,12 @@ internal object WeTypeClipboardImageHost {
             if (runtimeReady) return
             val cl = hostClassLoader ?: return
             runCatching { resolveScaleHandles(cl) }
-                .onFailure { AndroidLog.e(TAG, "resolve scale handles failed: ${it.message}") }
+                .onFailure { XLog.e("[$TAG] resolve scale handles failed: ${it.message}") }
             runCatching { resolveNavigation(cl) }
-                .onFailure { AndroidLog.e(TAG, "resolve navigation failed: ${it.message}") }
+                .onFailure { XLog.e("[$TAG] resolve navigation failed: ${it.message}") }
             runtimeReady = true
-            AndroidLog.i(
-                TAG,
-                "image host runtime resolved: line1=${dimenToPxRaw(line1HeightRes)} " +
+            XLog.i(
+                "[$TAG] image host runtime resolved: line1=${dimenToPxRaw(line1HeightRes)} " +
                     "line2=${dimenToPxRaw(line2HeightRes)} inset12=${rawToPxRaw(12)} " +
                     "indent=${dimenToPxRaw(inputIndentRes)} nav=${navMethod != null}"
             )
@@ -452,7 +453,7 @@ internal object WeTypeClipboardImageHost {
             break
         }
         if (scaleL0Method == null || rawScaleMethod == null) {
-            AndroidLog.e(TAG, "scale handles missing: l0=${scaleL0Method != null} e0=${rawScaleMethod != null}")
+            XLog.e("[$TAG] scale handles missing: l0=${scaleL0Method != null} e0=${rawScaleMethod != null}")
         }
     }
 
@@ -479,7 +480,7 @@ internal object WeTypeClipboardImageHost {
         navClipboardPanel = WeTypeHostContracts.constantOf(HostContractId.PANEL_CLIPBOARD_CONSTANT)
             ?: panel.enumConstants?.firstOrNull { (it as? Enum<*>)?.name == PANEL_CLIPBOARD }
         if (navPanel == null) {
-            AndroidLog.e(TAG, "ImagePreview panel enum missing")
+            XLog.e("[$TAG] ImagePreview panel enum missing")
             return
         }
         val n = WeTypeHostContracts.classOf(HostContractId.PANEL_MANAGER)
@@ -502,7 +503,7 @@ internal object WeTypeClipboardImageHost {
             }
         }
         if (navMethod == null) {
-            AndroidLog.e(TAG, "S33 navigation method missing (n3/p3/o3/k3)")
+            XLog.e("[$TAG] S33 navigation method missing (n3/p3/o3/k3)")
         }
     }
 
@@ -566,7 +567,7 @@ internal object WeTypeClipboardImageHost {
             method.invoke(manager, panel, bundle)
             true
         } catch (t: Throwable) {
-            AndroidLog.e(TAG, "open image preview failed: ${t.message}")
+            XLog.e("[$TAG] open image preview failed: ${t.message}")
             false
         }
     }
@@ -583,6 +584,8 @@ internal object WeTypeClipboardImageHost {
      */
     private class PendingScrollRestore(
         val rv: WeakReference<View>,
+        /** 保存时锚点所在的窗口 decor 根：宿主重建面板后旧 RV 失联，用它重新定位。 */
+        val decor: WeakReference<View>,
         val state: Parcelable,
         val itemCount: Int
     )
@@ -593,78 +596,284 @@ internal object WeTypeClipboardImageHost {
     /** 待恢复的滚动状态；同一时刻最多一份（重复进预览会覆盖旧的）。 */
     private var pendingScrollRestore: PendingScrollRestore? = null
 
+    /** 恢复轮询代数（仅主线程访问）：新的保存/恢复会顶掉上一轮轮询。 */
+    private var restoreGeneration = 0
+
+    /** 主线程 Handler：恢复轮询不能依赖待恢复 View 自身（宿主可能已把它从窗口拆掉）。 */
+    private val mainHandler = Handler(Looper.getMainLooper())
+
+    /** 恢复轮询间隔（ms）。 */
+    private const val RESTORE_POLL_MS = 120L
+
+    /** 恢复轮询总上限（ms）；到期仍未恢复则放弃。 */
+    private const val RESTORE_TIMEOUT_MS = 4000L
+
+    /** 条目数稳定判定（ms）：小于保存值且这段时间不再增长，视为数据已定型（真变了）。 */
+    private const val RESTORE_SETTLE_MS = 800L
+
     /**
      * 保存锚点所在剪贴板列表的滚动状态。
      *
      * 沿父链找 RecyclerView（按类名比对——模块没有 androidx.recyclerview 编译依赖，
      * 且宿主 R8 只改内部类名，`androidx.recyclerview.widget.RecyclerView` 本名不变）。
      * RecyclerView 把 `onSaveInstanceState()` 覆写为 public 并把 LayoutManager 滚动
-     * 位置打进返回的 Parcelable；但模块编译期只有 android.view.View 类型（那里它是
-     * protected），所以走反射。这两个方法 override 的是框架 View 的方法，R8 不会改名
-     * （改了就破坏多态分发），按名字找是安全的。
+     * 位置打进返回的 Parcelable。实测宿主 R8 连这个 override 的名字也改了，
+     * `getMethod("onSaveInstanceState")` 直接 NoSuchMethodException——所以从
+     * android.view.View 基类取 Method（框架方法名恒定不会被改），setAccessible
+     * 后 invoke，虚表派发必然命中真实 override（编译期直调则是 protected 不可见）。
      */
     private fun saveClipboardScrollState(anchor: View?) {
-        if (anchor == null) return
+        if (anchor == null) {
+            XLog.i("[$TAG] save scroll: anchor is null (click path passed no view)")
+            return
+        }
         pendingScrollRestore = null
         runCatching {
             var parent: ViewParent? = anchor.parent
             while (parent != null) {
                 if (parent.javaClass.name == RECYCLER_VIEW_CLASS) {
                     val rv = parent as? View ?: return
-                    val state = rv.javaClass.getMethod("onSaveInstanceState")
-                        .invoke(rv) as? Parcelable ?: return
+                    // 宿主 R8 会重命名 RecyclerView 的 override，按名反射取不到；
+                    // 从 View 基类拿 Method（框架方法名恒定），setAccessible 后
+                    // invoke 走虚表派发命中真实 override。
+                    val state = View::class.java
+                        .getDeclaredMethod("onSaveInstanceState")
+                        .apply { isAccessible = true }
+                        .invoke(rv) as? Parcelable
+                    if (state == null) {
+                        XLog.e("[$TAG] save scroll: onSaveInstanceState returned null")
+                        return
+                    }
                     val count = recyclerViewItemCount(rv)
                     if (count > 0) {
-                        pendingScrollRestore =
-                            PendingScrollRestore(WeakReference(rv), state, count)
-                        AndroidLog.i(TAG, "saved clipboard scroll state (itemCount=$count)")
+                        pendingScrollRestore = PendingScrollRestore(
+                            WeakReference(rv),
+                            WeakReference(anchor.rootView),
+                            state,
+                            count
+                        )
+                        XLog.i("[$TAG] saved clipboard scroll state " +
+                            "(itemCount=$count, rv=${System.identityHashCode(rv)}, " +
+                            "attached=${rv.isAttachedToWindow})")
+                    } else {
+                        XLog.e("[$TAG] save scroll: invalid itemCount=$count")
                     }
                     return
                 }
                 parent = parent.parent
             }
-        }.onFailure { AndroidLog.w(TAG, "save clipboard scroll state failed: ${it.message}") }
+            // 父链走完没找到 RecyclerView：锚点不在列表里（或宿主换了容器类）
+            XLog.e("[$TAG] save scroll: no RecyclerView found in anchor parent chain " +
+                "(anchor=${anchor.javaClass.name})")
+        }.onFailure { XLog.e("[$TAG] save clipboard scroll state failed: ${it.message}") }
     }
 
     /**
      * 恢复保存的滚动位置（预览返回、剪贴板面板重新打开后调用）。
      *
-     * 时序：宿主切回面板时会重置列表滚动，所以不能立即恢复——挂一次性
-     * OnLayoutChangeListener，等列表真正布局出内容（isShown 且有宽度）后再在
-     * 下一个消息循环里恢复，绕开宿主在布局后同步执行的 scrollToPosition(0)。
+     * 实测（2026-10-19 复测轮）推翻了上一版两个假设：
+     * 1. 宿主重开面板时 adapter 异步回填——保存时 294 条、重开首布局仅
+     *    13~15 条，「条目数相等才恢复」等不到匹配；
+     * 2. 返回后看到的列表可能是宿主重建的新 RecyclerView——旧实例上
+     *    onRestoreInstanceState 日志“成功”但视觉无效。
+     *
+     * 因此改为 120ms 轮询（上限 4s，仅主线程）：
+     * - 旧 RV 仍 attached 就直接用；否则从保存时的窗口 decor 树重新定位
+     *   当前可见的 RecyclerView（类名比对，多候选时按条目数择优）；
+     * - 条目数 ≥ 保存值（回填完成）才恢复；条目数更少且已稳定 800ms 或
+     *   轮询到期，视为数据真变了，放弃恢复停在顶部（避免跳到列表底部）；
+     * - 新的保存会顶掉本轮轮询；
+     * - 等待回填期间把列表临时置 INVISIBLE（恢复或放弃时复原 VISIBLE），
+     *   避免“先看到顶部一帧、再跳回原位置”的闪烁（2026-10-19 复测反馈）。
      */
     private fun scheduleScrollRestore() {
-        val pending = pendingScrollRestore ?: return
-        val rv = pending.rv.get() ?: run {
-            pendingScrollRestore = null
+        val pending = pendingScrollRestore ?: run {
+            XLog.i("[$TAG] restore: no pending scroll state")
             return
         }
         pendingScrollRestore = null
-        rv.addOnLayoutChangeListener(object : View.OnLayoutChangeListener {
-            override fun onLayoutChange(
-                v: View, left: Int, top: Int, right: Int, bottom: Int,
-                oldLeft: Int, oldTop: Int, oldRight: Int, oldBottom: Int
-            ) {
-                v.removeOnLayoutChangeListener(this)
-                if (!v.isShown || v.width <= 0) return
-                v.post {
-                    runCatching {
-                        // 数据变了（条目数不同）就不恢复，宁可停在顶部也不跳错位置
-                        if (recyclerViewItemCount(rv) != pending.itemCount) {
-                            AndroidLog.i(TAG, "skip scroll restore: item count changed")
-                            return@post
+        val generation = ++restoreGeneration
+        val startedAt = SystemClock.elapsedRealtime()
+        // 等待期间隐藏列表，恢复/放弃时复原——同步执行，赶在宿主首帧绘制前
+        val savedVisibilities = ArrayList<Pair<View, Int>>(4)
+        val hideForRestore: (View) -> Unit = { target ->
+            runCatching {
+                if (target.visibility == View.VISIBLE) {
+                    savedVisibilities.add(target to View.VISIBLE)
+                    target.visibility = View.INVISIBLE
+                }
+            }
+        }
+        // 被我们临时置 INVISIBLE 的视图仍视为有效恢复目标：
+        // resolveRestoreTarget 的 isShown 判定会把我们藏掉的 RV 判成不可用，
+        // 导致 4 秒轮询全程 no usable list（2026-10-19 13:00 复测轮实测）。
+        val isHiddenByUs: (View) -> Boolean = { v ->
+            savedVisibilities.any { it.first === v }
+        }
+        // 首帧压制：轮询是 post 消息，赶不上宿主面板的第一帧 traversal——
+        // 顶部列表先画一帧、下轮轮询才被藏掉，两段过渡肉眼可见闪烁
+        // （2026-10-19 复测反馈）。preDraw 在每帧绘制前同步执行，恢复完成前
+        // 一律按住目标列表，保证首帧就看不到顶部。
+        val suppressDecor = pending.decor.get()
+        val preDrawSuppressor = ViewTreeObserver.OnPreDrawListener {
+            // 本轮结束（恢复成功/放弃/被新保存顶掉）由 unhideForRestore 摘除
+            if (restoreGeneration != generation) return@OnPreDrawListener true
+            val target = runCatching {
+                resolveRestoreTarget(pending, isHiddenByUs)
+            }.getOrNull() ?: return@OnPreDrawListener true
+            hideForRestore(target)
+            true
+        }
+        runCatching {
+            if (suppressDecor != null && suppressDecor.viewTreeObserver.isAlive) {
+                suppressDecor.viewTreeObserver.addOnPreDrawListener(preDrawSuppressor)
+            }
+        }
+        val unhideForRestore = {
+            runCatching {
+                if (suppressDecor?.isAttachedToWindow == true &&
+                    suppressDecor.viewTreeObserver.isAlive
+                ) {
+                    suppressDecor.viewTreeObserver.removeOnPreDrawListener(preDrawSuppressor)
+                }
+                for ((v, vis) in savedVisibilities) {
+                    if (v.isAttachedToWindow) v.visibility = vis
+                }
+                savedVisibilities.clear()
+            }
+        }
+        val poll = object : Runnable {
+            var lastCount = -1
+            var lastCountAt = 0L
+            override fun run() {
+                if (restoreGeneration != generation) {
+                    XLog.i("[$TAG] restore poll superseded by newer save")
+                    return
+                }
+                val elapsed = SystemClock.elapsedRealtime() - startedAt
+                if (pending.rv.get() == null && pending.decor.get() == null) {
+                    restoreGeneration++
+                    unhideForRestore()
+                    XLog.e("[$TAG] scroll restore aborted: saved rv and decor both gone")
+                    return
+                }
+                val target = resolveRestoreTarget(pending, isHiddenByUs) ?: run {
+                    if (elapsed >= RESTORE_TIMEOUT_MS) {
+                        restoreGeneration++
+                        unhideForRestore()
+                        XLog.e("[$TAG] scroll restore gave up: no usable list " +
+                            "after ${elapsed}ms (saved itemCount=${pending.itemCount})")
+                    } else {
+                        mainHandler.postDelayed(this, RESTORE_POLL_MS)
+                    }
+                    return
+                }
+                val count = recyclerViewItemCount(target)
+                when {
+                    // 列表还没数据：继续等
+                    count <= 0 -> if (elapsed >= RESTORE_TIMEOUT_MS) {
+                        restoreGeneration++
+                        unhideForRestore()
+                        XLog.e("[$TAG] scroll restore gave up: empty list after ${elapsed}ms")
+                    } else {
+                        hideForRestore(target)
+                        mainHandler.postDelayed(this, RESTORE_POLL_MS)
+                    }
+                    // 数据回填到位：恢复
+                    count >= pending.itemCount -> {
+                        unhideForRestore()
+                        performScrollRestore(target, pending, elapsed)
+                    }
+                    // 条目数比保存值少：可能仍在回填，也可能数据真变了
+                    else -> {
+                        val now = SystemClock.elapsedRealtime()
+                        if (count != lastCount) {
+                            lastCount = count
+                            lastCountAt = now
                         }
-                        // 同 saveClipboardScrollState 的理由走反射（View 上是 protected）
-                        rv.javaClass
-                            .getMethod("onRestoreInstanceState", Parcelable::class.java)
-                            .invoke(rv, pending.state)
-                        AndroidLog.i(TAG, "restored clipboard scroll position")
-                    }.onFailure {
-                        AndroidLog.w(TAG, "restore clipboard scroll failed: ${it.message}")
+                        val settled = now - lastCountAt >= RESTORE_SETTLE_MS
+                        if (settled || elapsed >= RESTORE_TIMEOUT_MS) {
+                            restoreGeneration++
+                            unhideForRestore()
+                            XLog.e("[$TAG] scroll restore gave up: item count settled " +
+                                "at $count < saved ${pending.itemCount}")
+                        } else {
+                            hideForRestore(target)
+                            mainHandler.postDelayed(this, RESTORE_POLL_MS)
+                        }
                     }
                 }
             }
-        })
+        }
+        mainHandler.post(poll)
+    }
+
+    /**
+     * 解析恢复目标：保存的 RV 还挂在窗口上就直接用；否则（宿主重建了面板）
+     * 从保存时的 decor 树 BFS 找当前可见的 RecyclerView。
+     *
+     * 被我们为等待回填而临时置 INVISIBLE 的视图视为有效目标（2026-10-19 13:00
+     * 实测：isShown 判定否决了被自己藏掉的 RV，4 秒轮询全程 no usable list）。
+     *
+     * @param hiddenByUs 判断视图是否被本次恢复流程临时隐藏。
+     * @return 可见且有宽度的列表；暂时不满足返回 null（调用方继续轮询）。
+     */
+    private fun resolveRestoreTarget(
+        pending: PendingScrollRestore,
+        hiddenByUs: (View) -> Boolean
+    ): View? {
+        val savedRv = pending.rv.get()
+        if (savedRv != null && savedRv.isAttachedToWindow &&
+            (savedRv.isShown || hiddenByUs(savedRv)) && savedRv.width > 0
+        ) return savedRv
+        val decor = pending.decor.get() ?: return null
+        val candidates = ArrayList<View>(4)
+        val queue = ArrayDeque<View>()
+        queue.add(decor)
+        while (queue.isNotEmpty()) {
+            val v = queue.removeFirst()
+            if (v.javaClass.name == RECYCLER_VIEW_CLASS && (v.isShown || hiddenByUs(v)) && v.width > 0) {
+                candidates.add(v)
+            }
+            if (v is ViewGroup) {
+                for (i in 0 until v.childCount) queue.add(v.getChildAt(i))
+            }
+        }
+        if (candidates.isEmpty()) return null
+        if (candidates.size == 1) return candidates[0]
+        // 多候选：优先条目数与保存值一致的，否则挑条目数最多的（回填中的列表）
+        var best: View? = null
+        var bestCount = -1
+        for (c in candidates) {
+            val n = recyclerViewItemCount(c)
+            if (n == pending.itemCount) return c
+            if (n > bestCount) {
+                bestCount = n
+                best = c
+            }
+        }
+        XLog.e("[$TAG] restore: ${candidates.size} RecyclerViews in decor tree, " +
+            "picking largest (count=$bestCount, saved=${pending.itemCount})")
+        return best
+    }
+
+    /** 在目标列表上执行 onRestoreInstanceState 并记日志（同 save：View 基类 Method+虚表派发）。 */
+    private fun performScrollRestore(target: View, pending: PendingScrollRestore, elapsed: Long) {
+        restoreGeneration++
+        val rediscovered = target !== pending.rv.get()
+        runCatching {
+            View::class.java
+                .getDeclaredMethod("onRestoreInstanceState", Parcelable::class.java)
+                .apply { isAccessible = true }
+                .invoke(target, pending.state)
+            XLog.i("[$TAG] restored clipboard scroll position " +
+                "(rv=${System.identityHashCode(target)}" +
+                "${if (rediscovered) ", rediscovered" else ""}, " +
+                "count=${recyclerViewItemCount(target)}, saved=${pending.itemCount}, " +
+                "${elapsed}ms)")
+        }.onFailure {
+            XLog.e("[$TAG] restore clipboard scroll failed: ${it.message}")
+        }
     }
 
     /**
@@ -696,7 +905,7 @@ internal object WeTypeClipboardImageHost {
             method.invoke(manager, panel, bundle)
             true
         } catch (t: Throwable) {
-            AndroidLog.e(TAG, "open clipboard panel failed: ${t.message}")
+            XLog.e("[$TAG] open clipboard panel failed: ${t.message}")
             false
         }
     }
