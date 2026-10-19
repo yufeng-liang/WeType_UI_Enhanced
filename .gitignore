@@ -13,3 +13,11 @@ local.properties
 .settings
 *.log
 /wetype_work_space
+# 本地 release 签名凭据与密钥库，绝不提交
+keystore.properties
+keystore/
+*.jks
+*.keystore
+# 临时构建与调试产物
+.tmp_*
+host_base.apk

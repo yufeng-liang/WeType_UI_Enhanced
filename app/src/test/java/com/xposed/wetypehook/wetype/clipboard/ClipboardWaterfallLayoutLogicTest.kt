@@ -1,6 +1,8 @@
 package com.xposed.wetypehook.wetype.clipboard
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
@@ -202,5 +204,43 @@ class ClipboardWaterfallLayoutLogicTest {
     fun textViewportGoesNegativeWhenTheScrollViewOutrunsTheStaleCard() {
         // 滚动容器已经是新值、卡片还是旧值：扣完只剩负数，调用方据此跳过，不写坏 maxWidth。
         assertEquals(-220, ClipboardWaterfallLayoutLogic.textViewportPx(332, 1008, 456, -1, 0))
+    }
+
+    @Test
+    fun onlyDeleteLayoutKicksInWhenBothTopRowButtonsAreHidden() {
+        // 图片条目：常用语、选词都藏掉 → 只剩删除。
+        assertTrue(ClipboardWaterfallLayoutLogic.onlyDeleteVisible(false, false))
+        // 只要上排还剩一颗，就仍是「上排 + 下行删除」的原生排法。
+        assertFalse(ClipboardWaterfallLayoutLogic.onlyDeleteVisible(true, false))
+        assertFalse(ClipboardWaterfallLayoutLogic.onlyDeleteVisible(false, true))
+        assertFalse(ClipboardWaterfallLayoutLogic.onlyDeleteVisible(true, true))
+    }
+
+    @Test
+    fun deleteButtonFillsTheWholeBlockWhenItIsTheOnlyButtonLeft() {
+        // 整块 456x240、下排行高 118、间隙 4：只剩删除时吃满整块，且不留下边距。
+        val onlyDelete = ClipboardWaterfallLayoutLogic.deleteButtonMetricsPx(456, 240, 118, 4, true)
+        assertEquals(456, onlyDelete.widthPx)
+        assertEquals(240, onlyDelete.heightPx)
+        assertEquals(0, onlyDelete.marginTopPx)
+    }
+
+    @Test
+    fun deleteButtonStaysOnTheBottomRowWhenBothTopButtonsAreShown() {
+        val normal = ClipboardWaterfallLayoutLogic.deleteButtonMetricsPx(456, 240, 118, 4, false)
+        // 宽度一直是整块宽（删除本来就在下面独占一行），高度只取下排，上边距留一个间隙。
+        assertEquals(456, normal.widthPx)
+        assertEquals(118, normal.heightPx)
+        assertEquals(4, normal.marginTopPx)
+        // 负间隙按 0 处理，不会写出负 margin。
+        assertEquals(0, ClipboardWaterfallLayoutLogic.deleteButtonMetricsPx(456, 240, 118, -5, false).marginTopPx)
+    }
+
+    @Test
+    fun deleteButtonMetricsToleratesAnUnknownBlockHeight() {
+        // 卡片还没量出高度（block=0）：这里如实返回 0，由调用方原有的 0 值保护跳过。
+        val unknown = ClipboardWaterfallLayoutLogic.deleteButtonMetricsPx(456, 0, 0, 4, true)
+        assertEquals(456, unknown.widthPx)
+        assertEquals(0, unknown.heightPx)
     }
 }

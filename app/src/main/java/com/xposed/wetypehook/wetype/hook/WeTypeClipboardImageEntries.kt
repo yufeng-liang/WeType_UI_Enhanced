@@ -13,6 +13,7 @@ import android.view.ViewGroup
 import android.view.ViewParent
 import android.widget.ImageView
 import android.widget.TextView
+import com.xposed.wetypehook.wetype.clipboard.ClipboardClickRoutingLogic
 import com.xposed.wetypehook.wetype.clipboard.ClipboardImageEntryLogic
 import com.xposed.wetypehook.wetype.clipboard.ClipboardImageRowState
 import com.xposed.wetypehook.wetype.host.HostContractId
@@ -46,6 +47,13 @@ internal object WeTypeClipboardImageEntries {
     private const val THUMB_CORNER_DP = 6
     private const val THUMB_BG_COLOR = 0x14000000
     private const val TAG_ROW_CLICK = "wetype_clipboard_image_row_click"
+
+    /**
+     * 判断「这次点击是不是操作栏里的」时沿父链向上找的最大层数。
+     * 操作栏按钮自身可能没带 id，真正带 id 的是它的容器；实测层级不超过 3 层，
+     * 给到 6 层足够，同时避免顺着条目根节点误命中。
+     */
+    private const val ACTION_BAR_ANCESTOR_DEPTH = 6
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private val decodeExecutor = Executors.newFixedThreadPool(2) { r ->
@@ -122,6 +130,9 @@ internal object WeTypeClipboardImageEntries {
             val line2Px = WeTypeClipboardImageHost.dimenToPx(WeTypeClipboardImageHost.line2HeightRes)
             if (line1Px <= 0) return
             val type = WeTypeClipboardImageHost.itemType(item)
+            // 图片条目的展开操作栏只留「删除」：常用语 / 选词对图片无意义。条目视图会被复用，
+            // 所以文本条目这一支必须写回 VISIBLE，否则文本条目也会少两颗按钮。
+            WeTypeClipboardImageHost.syncActionBarForItem(itemView, type == 1L)
             if (type != 1L) {
                 boundItemByHolder.remove(holder)
                 thumbnailByHolder[holder]?.get()?.visibility = View.GONE
@@ -495,6 +506,27 @@ internal object WeTypeClipboardImageEntries {
                 runCatching { Class.forName(ADAPTER_CLASS, false, it) }.getOrNull()
             }
 
+    /**
+     * 这次点击是不是落在宿主的展开操作栏里（＋常用语 / 选词 / 删除 / 确认删除）。
+     *
+     * 按 id 判：命中的可能是按钮容器本身，也可能是它内部没被列进名单的装饰子视图，
+     * 所以沿父链向上找最近的、带已知操作栏 id 的祖先。宿主没给这些 id 时名单为空，
+     * 整条判定退化为「没命中」，行为与改动前一致。
+     */
+    private fun isHostActionBarHit(clicked: View): Boolean {
+        val ids = WeTypeClipboardImageHost.actionBarViewIds
+        if (ids.isEmpty()) return false
+        val ancestry = ArrayList<Int>(ACTION_BAR_ANCESTOR_DEPTH)
+        var view: View? = clicked
+        var depth = 0
+        while (view != null && depth < ACTION_BAR_ANCESTOR_DEPTH) {
+            ancestry.add(view.id)
+            view = view.parent as? View
+            depth++
+        }
+        return ClipboardClickRoutingLogic.isActionBarHit(ancestry, ids)
+    }
+
     private fun hookHolderClick(classLoader: ClassLoader) {
         val holderClass = resolveEntriesHost(classLoader)
             ?: throw ClassNotFoundException(Z_CLASS)
@@ -512,9 +544,11 @@ internal object WeTypeClipboardImageEntries {
                         val item = WeTypeClipboardImageHost.holderRecordItem(holder) ?: return@hookBefore
                         if (WeTypeClipboardImageHost.itemType(item) != 1L) return@hookBefore
                         val clicked = param.argumentOrNull(0) as? View ?: return@hookBefore
-                        // 「更多」按钮保持原生菜单；其余位置一律进大图预览，禁止直接粘贴。
+                        // 「更多」按钮保持原生菜单；展开后的操作栏（＋常用语 / 选词 / 删除 / 确认删除）
+                        // 也必须整体还给宿主 —— 漏放行会把「删除」当成整行点击，弹成大图预览。
                         val moreId = WeTypeClipboardImageHost.moreBtnId
                         if (moreId != 0 && clicked.id == moreId) return@hookBefore
+                        if (isHostActionBarHit(clicked)) return@hookBefore
                         clicked.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
                         if (WeTypeClipboardImageHost.itemPathType(item) != 0) {
                             WeTypeClipboardImageLoader.request(item, clicked.context, forceRetry = true) { updated ->

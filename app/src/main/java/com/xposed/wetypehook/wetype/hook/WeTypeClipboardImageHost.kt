@@ -67,6 +67,23 @@ internal object WeTypeClipboardImageHost {
         "com.tencent.wetype.plugin.hld.utils.q1"
     )
 
+    /**
+     * 展开操作栏的视图 id 字段名。图片条目的点击路由按这份名单整体放行给宿主，
+     * 顺序与 `WeTypeClipboardWaterfallHooks` 里挪按钮用的一致。
+     */
+    private val ACTION_BAR_ID_FIELDS = arrayOf(
+        "clipboard_action_container",
+        "clipboard_action_add_container",
+        "clipboard_action_add_icon",
+        "clipboard_action_add_text",
+        "clipboard_action_bomb_container",
+        "clipboard_action_bomb_icon",
+        "clipboard_action_bomb_text",
+        "clipboard_action_delete",
+        "clipboard_action_delete_icon",
+        "clipboard_action_delete_confirm"
+    )
+
     private const val KEY_CLIPBOARD_ID = "key_clipboard_id"
     private const val KEY_TARGET_TAB_INDEX = "target_tab_index"
     private const val KEY_FROM = "key_from"
@@ -127,6 +144,26 @@ internal object WeTypeClipboardImageHost {
     var moreBtnId: Int = 0
         private set
 
+    /**
+     * 展开操作栏（＋常用语 / 选词 / 删除 / 确认删除）里全部视图 id。
+     * 图片条目的点击路由要把这些点击还给宿主：漏一个就会把「删除」当整行点击，弹出大图预览。
+     */
+    @Volatile
+    var actionBarViewIds: Set<Int> = emptySet()
+        private set
+
+    /**
+     * 操作栏里「＋常用语」与「选词」两颗按钮的容器 id。
+     * 图片条目只保留「删除」—— 这两颗对图片没有任何意义，绑定图片条目时要把它们藏起来。
+     */
+    @Volatile
+    var actionAddViewId: Int = 0
+        private set
+
+    @Volatile
+    var actionBombViewId: Int = 0
+        private set
+
     @Volatile
     var line1HeightRes: Int = 0
         private set
@@ -185,6 +222,9 @@ internal object WeTypeClipboardImageHost {
         line1Id = 0
         keyInfoId = 0
         moreBtnId = 0
+        actionBarViewIds = emptySet()
+        actionAddViewId = 0
+        actionBombViewId = 0
         line1HeightRes = 0
         line2HeightRes = 0
         inputIndentRes = 0
@@ -418,6 +458,14 @@ internal object WeTypeClipboardImageHost {
             ?: Class.forName(IDS_CLASS, false, classLoader)
         contentTvId = ids.getField("clipboard_content_tv").getInt(null)
         moreBtnId = runCatching { ids.getField("clipboard_more_btn").getInt(null) }.getOrDefault(0)
+        // 操作栏 id 允许缺失（宿主改版时字段可能被裁掉），缺哪颗就只少放行哪颗。
+        actionBarViewIds = ACTION_BAR_ID_FIELDS.mapNotNull { name ->
+            runCatching { ids.getField(name).getInt(null) }.getOrNull()
+        }.filter { it != 0 }.toSet()
+        actionAddViewId =
+            runCatching { ids.getField("clipboard_action_add_container").getInt(null) }.getOrDefault(0)
+        actionBombViewId =
+            runCatching { ids.getField("clipboard_action_bomb_container").getInt(null) }.getOrDefault(0)
         contentScrollId = ids.getField("clipboard_content_scrollview").getInt(null)
         line1Id = ids.getField("clipboard_item_line1").getInt(null)
         keyInfoId = ids.getField("clipboard_key_information_rv").getInt(null)
@@ -1021,5 +1069,26 @@ internal object WeTypeClipboardImageHost {
     fun findView(itemView: View, id: Int): View? {
         if (id == 0) return null
         return runCatching { itemView.findViewById<View>(id) }.getOrNull()
+    }
+
+    /**
+     * 按条目类型同步展开操作栏的可用按钮：图片条目只留「删除」，普通条目恢复原生三颗。
+     *
+     * 「＋常用语」要把文本存成常用语、「选词」要把文本片段插进输入框，图片条目两样都没有，
+     * 点了只会得到空内容或落回整条图片，所以图片条目上直接藏掉。
+     *
+     * RecyclerView 会复用条目视图：同一条目视图这次绑图片、下次绑文本，所以**两个方向都要写**，
+     * 只藏不恢复会让文本条目也少两颗按钮。只在可见性真的不同时才写，避免绑定期多余的 requestLayout。
+     * 宿主没解析出这两个 id 时（老版本 / 字段被裁）静默跳过，保持原生行为。
+     */
+    fun syncActionBarForItem(itemView: View, isImage: Boolean) {
+        val visibility = if (isImage) View.GONE else View.VISIBLE
+        applyActionVisibility(itemView, actionAddViewId, visibility)
+        applyActionVisibility(itemView, actionBombViewId, visibility)
+    }
+
+    private fun applyActionVisibility(itemView: View, id: Int, visibility: Int) {
+        val view = findView(itemView, id) ?: return
+        if (view.visibility != visibility) view.visibility = visibility
     }
 }

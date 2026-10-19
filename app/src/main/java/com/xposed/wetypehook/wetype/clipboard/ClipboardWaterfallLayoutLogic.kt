@@ -158,6 +158,36 @@ internal object ClipboardWaterfallLayoutLogic {
         return top to bottom
     }
 
+    /** 「删除」按钮在操作栏里占的宽、高与上边距。 */
+    data class ActionDeleteMetrics(val widthPx: Int, val heightPx: Int, val marginTopPx: Int)
+
+    /**
+     * 「删除」按钮的尺寸：图片条目藏掉「常用语 / 选词」之后，上排空了，删除要独占整块宽高；
+     * 否则它只占下排（宽仍是整块宽，高是下排行高，上边距留一个间隙）。
+     *
+     * [onlyDelete] 为 true 时上边距归零 —— 上排容器两颗子项都 GONE，自身高度塌成 0，
+     * 删除贴着列顶摆放才正好铺满整块；留着间隙会让整块比卡片高出那一截。
+     */
+    fun deleteButtonMetricsPx(
+        blockWidthPx: Int,
+        blockHeightPx: Int,
+        bottomRowPx: Int,
+        gapPx: Int,
+        onlyDelete: Boolean
+    ): ActionDeleteMetrics {
+        if (onlyDelete) {
+            return ActionDeleteMetrics(blockWidthPx, blockHeightPx, 0)
+        }
+        return ActionDeleteMetrics(blockWidthPx, bottomRowPx, gapPx.coerceAtLeast(0))
+    }
+
+    /**
+     * 操作栏是否只剩「删除」一颗：上排两颗（常用语、选词）都不可见时成立。
+     * 图片条目就是这种情形 —— 那两颗对图片没有可操作的内容。
+     */
+    fun onlyDeleteVisible(addVisible: Boolean, bombVisible: Boolean): Boolean =
+        !addVisible && !bombVisible
+
     /**
      * 按钮圆角：与卡片一致，但不超过最矮一排高度的一半（再大就不是圆角矩形而是胶囊了）。
      * 读不到卡片圆角（[cardRadiusPx] ≤ 0）时退回行高的 [ACTION_FALLBACK_RADIUS_RATIO]。

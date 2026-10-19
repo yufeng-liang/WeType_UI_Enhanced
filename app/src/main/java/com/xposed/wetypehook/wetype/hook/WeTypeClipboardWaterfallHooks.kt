@@ -642,6 +642,12 @@ internal object WeTypeClipboardWaterfallHooks {
     private fun onBind(holder: Any) {
         if (!WeTypeSettings.isClipboardWaterfallFlowEnabledXposed()) return
         val itemView = holderItemView(holder) ?: return
+        // 图片条目只保留「删除」：这里也同步一次，不依赖 image entries 那条 hook 的注册顺序。
+        runCatching {
+            val item = WeTypeClipboardImageHost.holderRecordItem(holder) ?: return@runCatching
+            val isImage = WeTypeClipboardImageHost.itemType(item) == 1L
+            WeTypeClipboardImageHost.syncActionBarForItem(itemView, isImage)
+        }.onFailure { AndroidLog.e(TAG, "sync action bar failed: ${it.message}") }
         if (findItemView(itemView, containerId) == null) {
             // 分割条 / 页脚：占满整行。
             markFullSpan(itemView)
@@ -994,8 +1000,24 @@ internal object WeTypeClipboardWaterfallHooks {
         val (topRow, bottomRow) = ClipboardWaterfallLayoutLogic.actionRowHeightsPx(block, gap)
         if (buttonWidth <= 0 || topRow <= 0 || bottomRow <= 0) return
         val blockWidth = 2 * buttonWidth + gap
+        // 图片条目上「＋常用语 / 选词」被藏掉了（见 WeTypeClipboardImageHost.syncActionBarForItem），
+        // 上排空了就只剩「删除」一颗：让它独占整块宽高并贴住整块，而不是缩在上排的宽度、
+        // 留在下半行 —— 那样点起来只有半个卡片高，看起来也像少了按钮。文本条目复用同一视图时
+        // 两颗按钮会重新可见，这里必须走回 2+1 分支，所以按实时可见性判断，不能缓存。
+        val onlyDelete = ClipboardWaterfallLayoutLogic.onlyDeleteVisible(
+            addVisible = isActionVisible(views, itemView, ids.addId),
+            bombVisible = isActionVisible(views, itemView, ids.bombId)
+        )
+        // 上排两颗都 GONE 时它自身高度塌成 0，「删除」贴到列顶部，于是整块只剩一颗铺满。
+        val deleteMetrics = ClipboardWaterfallLayoutLogic.deleteButtonMetricsPx(
+            blockWidthPx = blockWidth,
+            blockHeightPx = block,
+            bottomRowPx = bottomRow,
+            gapPx = gap,
+            onlyDelete = onlyDelete
+        )
         val radius = ClipboardWaterfallLayoutLogic.actionCornerRadiusPx(
-            cardCornerRadiusPx(card), minOf(topRow, bottomRow)
+            cardCornerRadiusPx(card), if (onlyDelete) block else minOf(topRow, bottomRow)
         )
         val icon = (minOf(topRow, bottomRow) - 2 * dpToPx(itemView, ACTION_ICON_INSET_DP))
             .coerceIn(1, dpToPx(itemView, ACTION_ICON_MAX_DP))
@@ -1011,7 +1033,8 @@ internal object WeTypeClipboardWaterfallHooks {
         )
         styleActionButton(
             itemView, ids.deleteId, 0, ids.deleteIconId,
-            blockWidth, bottomRow, 0, gap, radius, icon, views
+            deleteMetrics.widthPx, deleteMetrics.heightPx, 0, deleteMetrics.marginTopPx,
+            radius, icon, views
         )
         // 本函数是从布局回调里调用的，写 LayoutParams 只会落到**下一次**布局上。更麻烦的是：布局
         // 过程中 `View.setLayoutParams` 触发的 requestLayout 会被 `ViewRootImpl.requestLayoutDuringLayout`
@@ -1077,6 +1100,16 @@ internal object WeTypeClipboardWaterfallHooks {
         return runCatching {
             shape.cornerRadius.toInt().takeIf { it > 0 } ?: shape.cornerRadii?.maxOrNull()?.toInt() ?: 0
         }.getOrDefault(0)
+    }
+
+    /**
+     * 这颗操作栏按钮当前是否可见。id 缺失（老版本字段被裁）或视图找不到都算「不可见」——
+     * 调用方只在「上排两颗都不可见」时才收成单颗删除，缺 id 时本来就摆不出 2+1，收成单颗正好。
+     */
+    private fun isActionVisible(views: Map<Int, View>?, itemView: View, id: Int): Boolean {
+        if (id == 0) return false
+        val view = findCollected(views, itemView, id) ?: return false
+        return view.visibility == View.VISIBLE
     }
 
     /** 按列宽与块高摆放一颗按钮。 */
