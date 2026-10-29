@@ -15,7 +15,7 @@
     <string name="settings_save">Save changes</string>
     <string name="settings_reset">Restore defaults</string>
     <string name="settings_restart">Restart WeType</string>
-    <string name="settings_saved">Settings saved</string>
+    <string name="settings_saved">Settings saved and applied</string>
     <string name="settings_save_failed">Could not save settings</string>
     <string name="settings_invalid_color">Invalid color format. Please use #RRGGBB.</string>
     <string name="settings_root_required">Root permission is required</string>
@@ -90,6 +90,8 @@
 
     <string name="settings_save_title">Save settings</string>
     <string name="settings_save_desc">Write the current configuration to the module</string>
+    <string name="settings_apply_title">Save and apply</string>
+    <string name="settings_apply_desc">Save the changes and restart the input method so they take effect</string>
     <string name="settings_reset_title">Restore defaults</string>
     <string name="settings_reset_desc">Reset all options to their default values</string>
     <string name="settings_clipboard_backup_unavailable">Could not open the clipboard backup page</string>

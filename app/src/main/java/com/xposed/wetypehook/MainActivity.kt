@@ -110,7 +110,6 @@ import top.yukonga.miuix.kmp.basic.Card
 import top.yukonga.miuix.kmp.basic.CardDefaults
 import top.yukonga.miuix.kmp.basic.HorizontalDivider
 import top.yukonga.miuix.kmp.basic.Icon
-import top.yukonga.miuix.kmp.basic.IconButton
 import top.yukonga.miuix.kmp.basic.MiuixScrollBehavior
 import top.yukonga.miuix.kmp.basic.Scaffold
 import top.yukonga.miuix.kmp.basic.Slider
@@ -125,7 +124,6 @@ import top.yukonga.miuix.kmp.preference.ArrowPreference
 import top.yukonga.miuix.kmp.icon.basic.ArrowRight
 import top.yukonga.miuix.kmp.icon.MiuixIcons
 import top.yukonga.miuix.kmp.icon.extended.Info
-import top.yukonga.miuix.kmp.icon.extended.Ok
 import top.yukonga.miuix.kmp.theme.MiuixTheme
 import top.yukonga.miuix.kmp.theme.darkColorScheme
 import top.yukonga.miuix.kmp.theme.lightColorScheme
@@ -614,9 +612,16 @@ private fun WeTypeSettingsScreen(
         return appearanceGroupColors[groupIndex(group.id)]
     }
 
+    /**
+     * 写盘并可选地让输入法进程立刻重读。
+     *
+     * @param restartIme true 时在写盘成功后重启输入法进程。本模块顶栏只有一颗按钮，
+     *   走的就是 `restartIme = true` 这条路：保存和生效合成一步，用户点完就看到新外观。
+     */
     fun saveSettings(
         successMessage: Int = R.string.settings_saved,
-        glassOverridesToSave: GlassMaterialOverrides? = parsedGlassOverrides
+        glassOverridesToSave: GlassMaterialOverrides? = parsedGlassOverrides,
+        restartIme: Boolean = true
     ): Boolean {
         if (glassOverridesToSave == null) {
             Toast.makeText(context, R.string.settings_glass_invalid, Toast.LENGTH_SHORT).show()
@@ -657,11 +662,22 @@ private fun WeTypeSettingsScreen(
             clipboardWaterfallFlowEnabled = clipboardWaterfallFlowEnabled,
             clipboardWaterfallMaxHeightDp = clipboardWaterfallMaxHeightDp,
             onPersisted = { saved ->
-                Toast.makeText(
-                    context,
-                    if (saved) successMessage else R.string.settings_save_failed,
-                    Toast.LENGTH_SHORT
-                ).show()
+                if (!saved) {
+                    Toast.makeText(context, R.string.settings_save_failed, Toast.LENGTH_SHORT).show()
+                    return@save
+                }
+                if (!restartIme) {
+                    Toast.makeText(context, successMessage, Toast.LENGTH_SHORT).show()
+                    return@save
+                }
+                // 写盘成功了才去动输入法进程。重启成功就按调用方的语义提示（默认「已保存并生效」，
+                // 恢复默认时是「已恢复默认」）；重启失败则要单独说，因为值虽然落盘了却还没生效。
+                val restarted = applySettingsToImeProcess(preferencesContext)
+                if (restarted) {
+                    Toast.makeText(context, successMessage, Toast.LENGTH_SHORT).show()
+                } else {
+                    Toast.makeText(context, R.string.settings_restart_failed, Toast.LENGTH_SHORT).show()
+                }
             }
         )
     }
@@ -735,14 +751,12 @@ private fun WeTypeSettingsScreen(
                     )
                 },
                 actions = {
-                    IconButton(
-                        onClick = { saveSettings() }
-                    ) {
-                        Icon(
-                            imageVector = MiuixIcons.Ok,
-                            contentDescription = stringResource(R.string.settings_save_title)
-                        )
-                    }
+                    // 顶栏只留这一颗：按下即「保存 + 立即重启输入法」，两个动作合一步走完。
+                    //
+                    // 上游是「✓ 保存」和「刷新」两颗分开（保存只落盘，刷新才重启）。本模块保持单按钮，
+                    // 是因为设置页寄生在宿主进程里、每次改动都要让用户立刻看到效果，多一颗按钮
+                    // 只是多一次「为什么没生效」的困惑。
+                    SettingsApplyButton(onClick = { saveSettings(restartIme = true) })
                 },
                 bottomContent = {
                     PreviewSection(

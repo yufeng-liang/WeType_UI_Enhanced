@@ -1,0 +1,108 @@
+package com.xposed.wetypehook.wetype.settings
+
+import android.app.ActivityManager
+import android.content.Context
+import android.os.Process
+import android.util.Log
+import com.xposed.wetypehook.ModuleApplication
+
+/**
+ * 让「保存」真正生效的那一步：优先请求 Xposed API 102 热重载，必要时再把微信输入法的
+ * **输入法进程**杀掉，让系统重新拉起。
+ *
+ * ## 为什么需要它
+ *
+ * 模块的设置全部走 Xposed hook 在运行时读取，输入法进程只在 `onStartInputView` 时
+ * 取一次快照。设置页（`ImeMainSettingActivity`）与输入法本体是两个进程：
+ *
+ * | 进程 | 作用 |
+ * | :--- | :--- |
+ * | `com.tencent.wetype` | 设置页、关于页所在进程 |
+ * | `com.tencent.wetype:hld` | 输入法本尊，模块 hook 在这里生效 |
+ *
+ * 在设置页里改的值写进了文件，但 `:hld` 里那份内存快照还是旧的 —— 所以必须重启
+ * `:hld` 才会重新读取。用户看到的「没法保存」并不是真的没保存，而是**没生效**。
+ *
+ * ## 为什么不是 `am force-stop`
+ *
+ * 历史实现（`2fde42d` 之前）走的是 `su -c "am force-stop com.tencent.wetype && ..."`，
+ * 要求 root，且在 LSPatch 场景下会把宿主输入法整个停掉。同一 uid 内其实不需要 root：
+ * `Process.sendSignal(pid, SIGNAL_KILL)` 是公开 API，对自己的进程永远合法。
+ *
+ * 只杀 `:hld`，不动设置页所在的主进程 —— 面板不会当场关闭，可以接着改下一项。
+ * 进程下次被系统拉起时重新读取配置，效果与「强行停止」一致。
+ *
+ * ## 本模块的实际情况（LSPosed + 寄生设置页）
+ *
+ * 两条路的适用性与上游正好相反：
+ * - 设置页寄生在宿主 Activity 上（`WeTypeHostLauncher` 挂 ComponentDialog），
+ *   跑在 `com.tencent.wetype` 进程里，而 `ModuleApplication` 只在**模块自己的进程**
+ *   被实例化 —— 寄生进程里 `xposedService` 恒为 null，API 102 那条路实际走不通；
+ * - 但寄生进程与 `:hld` 同 uid，下面的同 uid 信号才是真正生效的那条路。
+ * 独立模块进程里（未寄生时）反过来：能拿到 service，但发信号跨 uid 无效。
+ * 所以顺序保持「先 API 102、再同 uid」对两种场景都安全。
+ */
+internal object WeTypeProcessRestarter {
+
+    private const val TAG = "WeTypeRestart"
+    private const val WETYPE_PACKAGE_NAME = "com.tencent.wetype"
+
+    /** 输入法本体进程名。主进程同名不带后缀，设置页在那个进程里，不能杀。 */
+    private const val IME_PROCESS_SUFFIX = ":hld"
+
+    /**
+     * 杀掉当前应用所属 uid 下、进程名以 [IME_PROCESS_SUFFIX] 结尾的进程。
+     *
+     * 这条兜底必须是**同 uid**：`Process.sendSignal` 只对自己的 uid 有效。独立模块设置进程
+     * 先走 Xposed API 102；LSPatch 内嵌设置则继续复用宿主 uid 下的直接信号。
+     *
+     * @return 是否至少成功发出了一次信号。
+     */
+    fun restartImeProcess(context: Context): Boolean {
+        // 独立模块设置进程跑在 u0_a480，WeType 跑在另一个 uid，直接发信号无效。
+        // 先走 Xposed API 102 的跨进程热重载通道，发不出去才退回同 uid 信号。
+        if (ModuleApplication.requestHotReloadForWeType()) {
+            Log.i(TAG, "Requested API 102 hot reload for $WETYPE_PACKAGE_NAME$IME_PROCESS_SUFFIX")
+            return true
+        }
+        val appContext = context.applicationContext ?: context
+        val myUid = Process.myUid()
+        val activityManager = runCatching {
+            appContext.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
+        }.getOrNull()
+        if (activityManager == null) {
+            Log.w(TAG, "ActivityManager unavailable; cannot enumerate processes")
+            return false
+        }
+
+        val targets = runCatching { activityManager.runningAppProcesses }
+            .getOrNull()
+            ?.filter { info ->
+                info.uid == myUid &&
+                    info.processName != null &&
+                    info.processName.endsWith(IME_PROCESS_SUFFIX) &&
+                    info.pid != Process.myPid()
+            }
+            .orEmpty()
+
+        if (targets.isEmpty()) {
+            Log.w(TAG, "No $WETYPE_PACKAGE_NAME$IME_PROCESS_SUFFIX process found under uid $myUid")
+            return false
+        }
+
+        var signaled = false
+        targets.forEach { info ->
+            val sent = runCatching {
+                Process.sendSignal(info.pid, Process.SIGNAL_KILL)
+                true
+            }.onFailure {
+                Log.e(TAG, "Failed to signal pid ${info.pid} (${info.processName})", it)
+            }.getOrDefault(false)
+            if (sent) {
+                signaled = true
+                Log.i(TAG, "Signaled ${info.processName} (pid ${info.pid}) to restart")
+            }
+        }
+        return signaled
+    }
+}
