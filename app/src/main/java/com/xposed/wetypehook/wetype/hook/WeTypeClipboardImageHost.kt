@@ -9,6 +9,7 @@ import android.view.View
 import android.view.ViewGroup
 import android.view.ViewTreeObserver
 import android.view.ViewParent
+import com.xposed.wetypehook.wetype.clipboard.ClipboardImageEntryLogic
 import com.xposed.wetypehook.wetype.host.HostContractId
 import com.xposed.wetypehook.wetype.host.HostResources
 import com.xposed.wetypehook.wetype.host.WeTypeHostContracts
@@ -312,12 +313,17 @@ internal object WeTypeClipboardImageHost {
     }
 
     /**
-     * 恢复关联图片预览页的“保存到相册”。
+     * 按图片来源决定预览页是否保留“保存到相册”。
      *
-     * 宿主 `keyboard.k#c(local)` 在图片已是本地文件（pathType=0）时隐藏保存按钮；
-     * 模块为同步图片提前下载解密，导致走本地分支后保存入口消失。这里在
-     * `k#e(item, tempPath, local)` 绑定完成后，对同步来源图片（receiveTimestampFromServer>0）
-     * 重新按远端样式渲染一次卡片，恢复“保存到相册 + 发送”。
+     * 宿主 `keyboard.k#c(local)` 在图片已是本地文件（pathType=0）时隐藏保存按钮。
+     * 模块为同步图片提前下载解密，导致它走了本地分支、保存入口消失 —— 所以这里在
+     * `k#e(item, tempPath, local)` 绑定完成后，只对**跨设备同步**图片
+     * （receiveTimestampFromServer>0）重新按远端样式渲染一次卡片，恢复
+     * “保存到相册 + 发送”。
+     *
+     * 本机图片（receiveTimestampFromServer==0）不动：它本来就是本地文件，再往系统相册
+     * 存一份是重复，保持宿主原生的“只发送”。
+     *
      * 点击保存仍走宿主原生 `S33ImagePreviewKeyboard.a()` → SavePicHelper，落盘到
      * 系统相册 `Pictures/WeType`（MediaStore），即宿主原有路径。
      */
@@ -345,8 +351,11 @@ internal object WeTypeClipboardImageHost {
         refreshMethod.isAccessible = true
         bindMethod.hookAfter { param ->
             val item = param.argumentOrNull(0) ?: return@hookAfter
-            // 本机图片与同步图片统一按远端样式刷新：宿主对本地文件会隐藏
-            // 「保存到相册」，但剪贴板里的图片并不在系统相册中，保存入口应当保留。
+            // 只有跨设备同步来的图片才补“保存到相册”：它没进过系统相册，存一份有意义。
+            // 本机图片本来就在本地，再存一份是重复，保持宿主原生的“只发送”。
+            if (!ClipboardImageEntryLogic.shouldOfferSaveToGallery(itemReceiveTimestamp(item))) {
+                return@hookAfter
+            }
             runCatching { refreshMethod.invoke(param.thisObject, false) }
                 .onFailure { XLog.e("[$TAG] restore image save action failed: ${it.message}") }
         }

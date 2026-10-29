@@ -71,6 +71,18 @@ internal object ClipboardImageEntryLogic {
     }
 
     /**
+     * 预览页是否保留“保存到相册”。
+     *
+     * 只有跨设备同步来的图片需要这个入口 —— 它没进过系统相册，存一份才有意义。
+     * 本机图片（receiveTimestampFromServer==0）本来就躺在本地，再往 `Pictures/WeType`
+     * 复制一份是重复文件，宿主原生就是“只发送”，保持不动。
+     *
+     * @param receiveTimestampFromServer >0 表示跨设备同步条目
+     */
+    fun shouldOfferSaveToGallery(receiveTimestampFromServer: Long): Boolean =
+        receiveTimestampFromServer > 0L
+
+    /**
      * 行态决策：
      * @param itemType C.getType()（0 文本 / 1 图片）
      * @param receiveTimestampFromServer >0 表示跨设备同步条目

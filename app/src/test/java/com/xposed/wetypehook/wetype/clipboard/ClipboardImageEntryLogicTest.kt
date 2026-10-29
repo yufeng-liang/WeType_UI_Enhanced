@@ -119,6 +119,17 @@ class ClipboardImageEntryLogicTest {
     }
 
     @Test
+    fun saveToGalleryOfferedOnlyForCrossDeviceImages() {
+        // 跨设备同步来的图片：没进过系统相册，给“保存到相册 + 发送”
+        assertTrue(
+            ClipboardImageEntryLogic.shouldOfferSaveToGallery(1_700_000_000_000L)
+        )
+        // 本机图片：本来就在本地，再存一份是重复，只给“发送”
+        assertFalse(ClipboardImageEntryLogic.shouldOfferSaveToGallery(0L))
+        assertFalse(ClipboardImageEntryLogic.shouldOfferSaveToGallery(-1L))
+    }
+
+    @Test
     fun storeFileNameKeepsSafeExtension() {
         assertEquals("42.jpg", imageStoreFileName(42L, "jpg"))
         assertEquals("42.png", imageStoreFileName(42L, "PNG"))
