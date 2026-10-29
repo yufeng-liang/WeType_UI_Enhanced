@@ -336,6 +336,8 @@ internal object WeTypeWindowHooks {
                     if (!state.windowVisible) prepareBackgroundShow(state)
                     state.windowVisible = true
                     state.computedVisibleImeHeightPx = null
+                    // 键盘重新显示时兜底撤销预览页留下的透明遮罩，避免"能打字但看不见"。
+                    WeTypeClipboardImageHost.restorePreviewLayers()
                 }
                 "updateFullscreenMode" -> {
                     if (!state.windowVisible) return@runCatching

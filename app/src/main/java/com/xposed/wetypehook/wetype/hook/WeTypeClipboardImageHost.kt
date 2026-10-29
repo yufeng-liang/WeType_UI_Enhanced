@@ -55,6 +55,9 @@ internal object WeTypeClipboardImageHost {
     private const val PREVIEW_KEYBOARD_CLASS =
         "com.tencent.wetype.plugin.hld.keyboard.S33ImagePreviewKeyboard"
 
+    /** 预览页消失后延迟多少毫秒再撤销透明遮罩（等宿主退出动画结束，避免预览页里透出键盘）。 */
+    private const val PREVIEW_RESTORE_DELAY_MS = 400L
+
     /** 尺寸换算单例的候选短名（`clipboard.scale.instance` 契约失效时的最后手段）。 */
     private val SCALE_INSTANCE_CLASSES = arrayOf(
         "com.tencent.wetype.plugin.hld.utils.n1",
@@ -194,10 +197,20 @@ internal object WeTypeClipboardImageHost {
      * 这里把它们临时隐藏，让透明预览页直接露出键盘 carrier。
      */
     private class PreviewState(
+        val container: ViewGroup,
         val decor: View,
-        val hidden: List<Pair<View, Float>>,
         val layoutListener: ViewTreeObserver.OnGlobalLayoutListener,
         val observer: ViewTreeObserver
+    )
+
+    /**
+     * 被预览页隐藏的兄弟层：容器 -> (子视图 -> 隐藏前的 alpha)。
+     *
+     * 按容器登记而不是每次预览各自记一份：宿主可能同时存在多个预览页实例，
+     * 若各自记录，后一次会把前一次留下的 `0f` 当成原始值，恢复后键盘永久透明。
+     */
+    private val hiddenSiblings = java.util.Collections.synchronizedMap(
+        java.util.WeakHashMap<ViewGroup, MutableMap<View, Float>>()
     )
 
     /**
@@ -231,6 +244,8 @@ internal object WeTypeClipboardImageHost {
         getterCache.clear()
         setterCache.clear()
         holderItemFieldCache.clear()
+        // 先撤销预览页留下的透明遮罩：否则热重载后键盘会永久看不见（只能打字）。
+        restorePreviewLayers()
         previewStates.clear()
         trackedPreviews.clear()
     }
@@ -387,37 +402,88 @@ internal object WeTypeClipboardImageHost {
     }
 
     private fun showPreviewOverKeyboard(view: View) {
-        if (previewStates.containsKey(view)) return
+        if (synchronized(previewStates) { previewStates.containsKey(view) }) return
         val slot = view.parent as? ViewGroup ?: return
         val container = slot.parent as? ViewGroup ?: return
         val decor = view.rootView
-        val hidden = ArrayList<Pair<View, Float>>()
-        for (index in 0 until container.childCount) {
-            val child = container.getChildAt(index)
-            if (child === slot || child.visibility != View.VISIBLE) continue
-            hidden.add(child to child.alpha)
-            // 不能用 INVISIBLE：MIUI 底部栏会据此把两个图标整体下移 6px。
-            child.alpha = 0f
-        }
+        hideSiblingsBehind(container, slot)
         val observer = container.viewTreeObserver
         val layoutListener = ViewTreeObserver.OnGlobalLayoutListener {
-            // 宿主切页时可能重新显示键盘层，预览期间保持透明。
-            hidden.forEach { (child, _) ->
-                if (child.alpha != 0f) child.alpha = 0f
+            if (!isPreviewPageShown(view, slot)) {
+                // 预览页被隐藏或移出后必须还原：布局回调原本只负责"预览期间保持透明"，
+                // 一旦宿主把预览页藏起来又不再 detach，键盘就会永久透明（能打字、看不见）。
+                container.postDelayed({
+                    if (!isPreviewPageShown(view, slot)) hidePreviewOverKeyboard(view)
+                }, PREVIEW_RESTORE_DELAY_MS)
+                return@OnGlobalLayoutListener
             }
+            // 宿主切页时可能重新显示键盘层，预览期间保持透明。
+            hideSiblingsBehind(container, slot)
         }
         observer.addOnGlobalLayoutListener(layoutListener)
-        previewStates[view] = PreviewState(decor, hidden, layoutListener, observer)
+        synchronized(previewStates) {
+            previewStates[view] = PreviewState(container, decor, layoutListener, observer)
+        }
         WeTypeWindowHooks.setPreviewActive(decor, true)
     }
 
-    private fun hidePreviewOverKeyboard(view: View) {
-        val state = previewStates.remove(view) ?: return
-        if (state.observer.isAlive) state.observer.removeOnGlobalLayoutListener(state.layoutListener)
-        state.hidden.forEach { (child, alpha) ->
-            if (child.alpha == 0f) child.alpha = alpha
+    /** 预览页仍在用户眼前时才需要继续隐藏兄弟层。 */
+    private fun isPreviewPageShown(view: View, slot: ViewGroup): Boolean =
+        view.isAttachedToWindow &&
+            view.visibility == View.VISIBLE &&
+            view.parent === slot &&
+            view.isShown
+
+    private fun hideSiblingsBehind(container: ViewGroup, slot: View) {
+        val records = synchronized(hiddenSiblings) {
+            hiddenSiblings.getOrPut(container) { java.util.WeakHashMap() }
         }
-        WeTypeWindowHooks.setPreviewActive(state.decor, false)
+        synchronized(records) {
+            for (index in 0 until container.childCount) {
+                val child = container.getChildAt(index)
+                if (child === slot || child.visibility != View.VISIBLE) continue
+                // 只记录第一次隐藏前的 alpha，且绝不把 0 当原始值（否则恢复后键盘仍然透明）。
+                if (!records.containsKey(child) && child.alpha != 0f) records[child] = child.alpha
+                // 不能用 INVISIBLE：MIUI 底部栏会据此把两个图标整体下移 6px。
+                if (child.alpha != 0f) child.alpha = 0f
+            }
+        }
+    }
+
+    private fun restoreSiblings(container: ViewGroup) {
+        val records = synchronized(hiddenSiblings) { hiddenSiblings.remove(container) } ?: return
+        synchronized(records) {
+            records.forEach { (child, alpha) ->
+                runCatching { if (child.alpha != alpha) child.alpha = alpha }
+            }
+        }
+    }
+
+    private fun hidePreviewOverKeyboard(view: View) {
+        val state = synchronized(previewStates) { previewStates.remove(view) } ?: return
+        if (state.observer.isAlive) state.observer.removeOnGlobalLayoutListener(state.layoutListener)
+        restoreSiblings(state.container)
+        val othersActive = synchronized(previewStates) {
+            previewStates.values.any { it.decor === state.decor }
+        }
+        if (!othersActive) WeTypeWindowHooks.setPreviewActive(state.decor, false)
+    }
+
+    /**
+     * 兜底还原：键盘重新显示或模块热重载时，把已不可见预览页留下的隐藏全部撤销。
+     * 预览页实例可能被宿主长期持有、退出时只改 visibility 而不 detach，仅靠 detach 回调不可靠。
+     */
+    fun restorePreviewLayers() {
+        val states = synchronized(previewStates) { previewStates.entries.toList() }
+        // 预览页仍在显示时不能还原，否则键盘会从预览页底下透出来。
+        states.forEach { (page, state) ->
+            if (!isPreviewPageShown(page, state.container)) hidePreviewOverKeyboard(page)
+        }
+        val activeContainers = synchronized(previewStates) { previewStates.values.map { it.container } }
+        val containers = synchronized(hiddenSiblings) { hiddenSiblings.keys.toList() }
+        containers.forEach { container ->
+            if (activeContainers.none { it === container }) restoreSiblings(container)
+        }
     }
 
     fun isReady(): Boolean = installed
