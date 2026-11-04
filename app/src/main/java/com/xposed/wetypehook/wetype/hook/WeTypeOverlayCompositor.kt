@@ -119,6 +119,16 @@ internal object WeTypeOverlayCompositor {
         rootViews.map { it.rootView }.distinct().filter(::containsHostLayer).forEach(::registerWindow)
     }
 
+    /**
+     * 悬浮键盘的 PopupWindow 不经过 InputMethodService 的窗口生命周期回调，且宿主
+     * 把浮动视图的 getRootView() 重写为背景容器，reconcile 的 containsHostLayer
+     * 过滤会漏掉整棵浮动树。悬浮模式下的面板遮挡改为直接从 PopupWindow 内容根
+     * 注册逐帧观察，复用同一套图层合成与 drawChild 遮罩。
+     */
+    fun registerFloatingRoot(root: View) {
+        if (root is ViewGroup) registerWindow(root)
+    }
+
     private fun containsHostLayer(view: View): Boolean {
         if (view.javaClass.name == CANDIDATE_VIEW || isKeyboardRoot(view)) return true
         return view is ViewGroup && (0 until view.childCount).any {

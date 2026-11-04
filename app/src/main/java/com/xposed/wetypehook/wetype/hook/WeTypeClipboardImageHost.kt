@@ -279,9 +279,10 @@ internal object WeTypeClipboardImageHost {
     }
 
     /**
-     * 图片预览页（S33）走宿主 `keyboard.l#B0` 作为左上角“收回”。
-     * 模块是直接用 `N.n3(ImagePreview, Bundle)` 切页的，不在宿主页面栈里，
-     * 原生收回会落到普通键盘。这里拦截 S33 的收回并手动导航回剪贴板面板。
+     * 图片预览页（S33）的左上角“收回”走宿主 `keyboard.l` 的返回处理：3.x 是 B0 ()V，
+     * 4.0.1 起挪到 A0 ()V（见下方查找注释）。模块是直接用 `N.n3(ImagePreview, Bundle)`
+     * 切页的，不在宿主页面栈里，原生收回会落到普通键盘。这里拦截 S33 的收回并手动
+     * 导航回剪贴板面板。
      *
      * 注意：宿主切回面板时会把列表滚动重置到顶部（实测 m00559），页面未销毁并不等于
      * 滚动位置还在——所以面板重开后要调 [scheduleScrollRestore] 恢复原滚动位置。
@@ -293,10 +294,13 @@ internal object WeTypeClipboardImageHost {
         }
         val baseClass = resolvePreviewHost(classLoader)
             ?: throw ClassNotFoundException(PREVIEW_HOST_CLASS)
-        val backMethod = pickHostMethod(baseClass, "B0") {
+        // 3.x：返回处理是 B0 ()V；4.0.1 起 B0 变成 ()Z 且被 y0 样式刷新调用（预览页
+        // 打开即触发，拦它会直接把预览页切走），返回语义挪到了 A0 ()V——返回按钮的
+        // click 回调 l$a.a(View) 直接调 A0。两级查找按名字兜底兼容新旧宿主。
+        val backMethod = pickHostMethod(baseClass, "A0", "B0") {
             it.parameterTypes.isEmpty() && it.returnType == Void.TYPE
         } ?: run {
-            XLog.e("[$TAG] image preview back method missing (keyboard.l#B0)")
+            XLog.e("[$TAG] image preview back method missing (keyboard.l#A0/B0)")
             return
         }
         backMethod.isAccessible = true

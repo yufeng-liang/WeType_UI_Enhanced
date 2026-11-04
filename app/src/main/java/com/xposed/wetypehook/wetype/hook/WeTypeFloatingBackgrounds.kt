@@ -6,6 +6,7 @@ import android.graphics.Rect
 import android.graphics.drawable.BitmapDrawable
 import android.graphics.drawable.Drawable
 import android.graphics.drawable.NinePatchDrawable
+import android.os.IBinder
 import android.view.View
 import android.view.ViewGroup
 import android.view.ViewParent
@@ -82,14 +83,17 @@ internal object WeTypeFloatingBackgrounds {
         removeBackground = remove
         if (installed) return
         val methods = PopupWindow::class.java.declaredMethods
-            .filter { it.name == "showAtLocation" }
+            .filter(::showAtLocationShortcut)
             .sortedBy { it.toGenericString() }
         methods.forEach { method ->
             runCatching {
                 method.hookAfter { param ->
                     val popup = param.thisObject as? PopupWindow ?: return@hookAfter
                     if (!popup.isShowing || updateBackground == null) return@hookAfter
-                    runCatching { registerHost(popup.contentView) }.onFailure {
+                    runCatching {
+                        registerHost(popup.contentView)
+                        WeTypeOverlayCompositor.registerFloatingRoot(popup.contentView)
+                    }.onFailure {
                         Log.i("Failed: Observe WeType floating popup")
                         Log.i(it)
                     }
@@ -143,7 +147,12 @@ internal object WeTypeFloatingBackgrounds {
         // Use the actual WindowManager roots supplied by the caller. Floating host
         // views override getRootView() to return only their background container.
         fun visit(view: View) {
-            if (view.javaClass.name.startsWith(FLOATING_HOST_PREFIX)) registerHost(view)
+            if (view.javaClass.name.startsWith(FLOATING_HOST_PREFIX)) {
+                registerHost(view)
+                // 热重载后悬浮 popup 已在显示，showAtLocation 不会再次触发；从
+                // reconcile 路径补注册遮挡合成观察。
+                WeTypeOverlayCompositor.registerFloatingRoot(view)
+            }
             if (view is ViewGroup) {
                 for (index in 0 until view.childCount) visit(view.getChildAt(index))
             }
@@ -155,6 +164,11 @@ internal object WeTypeFloatingBackgrounds {
             }
         }
     }
+
+    /** showAtLocation 有多个重载，只挂悬浮键盘实际使用的 (IBinder token, gravity, x, y) 版本 */
+    private fun showAtLocationShortcut(method: Method): Boolean =
+        method.name == "showAtLocation" && method.parameterCount == 4 &&
+            method.parameterTypes[0] == IBinder::class.java
 
     private fun registerHost(view: View?) {
         val host = view as? ViewGroup ?: return
