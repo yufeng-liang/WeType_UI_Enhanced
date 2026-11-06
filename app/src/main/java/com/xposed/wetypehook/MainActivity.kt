@@ -1166,7 +1166,7 @@ private fun WeTypeSettingsScreen(
                             onClick = {
                                 val intent = Intent(
                                     Intent.ACTION_VIEW,
-                                    Uri.parse("https://github.com/NEORUAA/WeType_UI_Enhanced")
+                                    Uri.parse("https://github.com/yufeng-liang/WeType_UI_Enhanced")
                                 )
                                 context.startActivity(intent)
                             }
