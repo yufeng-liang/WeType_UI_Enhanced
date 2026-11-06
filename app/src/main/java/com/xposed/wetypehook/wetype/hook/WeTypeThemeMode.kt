@@ -2,8 +2,8 @@ package com.xposed.wetypehook.wetype.hook
 
 import android.content.res.Resources
 import android.util.Log
+import com.xposed.wetypehook.wetype.host.HostDexKit
 import com.xposed.wetypehook.wetype.settings.WeTypeSettings
-import org.luckypray.dexkit.DexKitBridge
 import java.io.File
 import java.lang.reflect.Method
 import java.lang.reflect.Modifier
@@ -35,30 +35,30 @@ internal object WeTypeThemeMode {
         val cacheKey = "$MANAGER_CACHE_PREFIX.${Integer.toHexString(sourceDir.hashCode())}"
         val accessor = runCatching {
             readCachedAccessor(classLoader, cacheKey, sourceIdentity)?.let { return@runCatching it }
-            System.loadLibrary("dexkit")
-            DexKitBridge.create(sourceDir).use { bridge ->
-                // The log tag identifies the manager without depending on obfuscated names.
-                val manager = bridge.findMethod {
-                    matcher {
-                        returnType = String::class.java.name
-                        paramCount = 0
-                        usingStrings("ImeSkinManager")
-                    }
-                }.mapNotNull { result ->
-                    runCatching { result.getMethodInstance(classLoader) }.getOrNull()
-                }.filter { method ->
-                    method.name == "getTAG" &&
-                        method.declaringClass.name.startsWith(HOST_SKIN_PACKAGE)
-                }.map { it.declaringClass }.distinct().singleOrNull()
-                    ?: error("Could not uniquely identify the host skin manager")
+            // 复用进程级共享的 DexKit bridge，避免启动期对 216MB 的宿主包重复解析
+            val bridge = HostDexKit.get(sourceDir)
+                ?: error("DexKit bridge unavailable for host skin mode lookup")
+            // The log tag identifies the manager without depending on obfuscated names.
+            val manager = bridge.findMethod {
+                matcher {
+                    returnType = String::class.java.name
+                    paramCount = 0
+                    usingStrings("ImeSkinManager")
+                }
+            }.mapNotNull { result ->
+                runCatching { result.getMethodInstance(classLoader) }.getOrNull()
+            }.filter { method ->
+                method.name == "getTAG" &&
+                    method.declaringClass.name.startsWith(HOST_SKIN_PACKAGE)
+            }.map { it.declaringClass }.distinct().singleOrNull()
+                ?: error("Could not uniquely identify the host skin manager")
 
-                val resolved = resolveDarkModeAccessor(manager)
-                    ?: error("Could not uniquely identify the host skin mode accessor")
-                // Only strings cross module generations. This avoids retaining the old loader
-                // or reopening its native library while Android has not unloaded it yet.
-                runCatching { System.setProperty(cacheKey, "$sourceIdentity\n${manager.name}") }
-                resolved
-            }
+            val resolved = resolveDarkModeAccessor(manager)
+                ?: error("Could not uniquely identify the host skin mode accessor")
+            // Only strings cross module generations. This avoids retaining the old loader
+            // or reopening its native library while Android has not unloaded it yet.
+            runCatching { System.setProperty(cacheKey, "$sourceIdentity\n${manager.name}") }
+            resolved
         }.onFailure {
             Log.w(TAG, "Host skin mode unavailable; using resource configuration", it)
         }.getOrNull() ?: return

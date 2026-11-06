@@ -1,6 +1,7 @@
 package com.xposed.wetypehook.wetype.hook
 
 import com.xposed.wetypehook.wetype.host.HOST_PACKAGE
+import com.xposed.wetypehook.wetype.host.HostDexKit
 import com.xposed.wetypehook.wetype.host.pickHostField
 import com.xposed.wetypehook.wetype.host.pickHostMethod
 import com.xposed.wetypehook.wetype.settings.WeTypeSettings
@@ -55,15 +56,14 @@ internal object WeTypeClipboardHooks {
         }
 
         runCatching {
-            System.loadLibrary("dexkit")
-            DexKitBridge.create(sourceDir).use { bridge ->
-                hookCrossDevicePersist(bridge, classLoader)
-                hookSystemPaste(bridge, classLoader)
-                hookRetentionCount(bridge, classLoader)
-                hookRetentionDuration(bridge, classLoader)
-                hookTextLimit(bridge, classLoader)
-                hookExceedTip(bridge, classLoader)
-            }
+            // 复用进程级共享的 DexKit bridge，避免启动期对 216MB 的宿主包重复解析
+            val bridge = HostDexKit.get(sourceDir) ?: return@runCatching
+            hookCrossDevicePersist(bridge, classLoader)
+            hookSystemPaste(bridge, classLoader)
+            hookRetentionCount(bridge, classLoader)
+            hookRetentionDuration(bridge, classLoader)
+            hookTextLimit(bridge, classLoader)
+            hookExceedTip(bridge, classLoader)
             Log.i("Success: WeType clipboard hooks installation completed")
         }.onFailure {
             Log.e("Failed: Installing WeType clipboard hooks: ${it.message}")
