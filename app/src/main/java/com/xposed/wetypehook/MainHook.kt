@@ -4,7 +4,6 @@ import android.app.Activity
 import android.content.Context
 import android.content.Intent
 import android.content.res.AssetManager
-import android.content.res.Configuration
 import android.content.res.Resources
 import android.graphics.Color
 import android.graphics.Rect
@@ -30,6 +29,9 @@ import com.xposed.wetypehook.wetype.hook.WeTypeClipboardImageList
 import com.xposed.wetypehook.wetype.hook.WeTypeClipboardImageLoader
 import com.xposed.wetypehook.wetype.hook.WeTypeClipboardRetentionGuard
 import com.xposed.wetypehook.wetype.hook.WeTypeResourceHooks
+import com.xposed.wetypehook.wetype.hook.WeTypeKeyboardSymbols
+import com.xposed.wetypehook.wetype.hook.WeTypeKeyboardCorners
+import com.xposed.wetypehook.wetype.hook.WeTypeThemeMode
 import com.xposed.wetypehook.wetype.hook.WeTypeUpdateHooks
 import com.xposed.wetypehook.wetype.hook.WeTypeWindowHooks
 import com.xposed.wetypehook.wetype.host.WeTypeHostContracts
@@ -74,7 +76,6 @@ private const val INPUT_METHOD_BOTTOM_MANAGER = "com.miui.inputmethod.InputMetho
 private const val WETYPE_ABOUT_ACTIVITY = "com.tencent.wetype.plugin.hld.ui.ImeAboutActivity"
 private const val WETYPE_ABOUT_LOGO_TAG_KEY = 0x4D495549
 private const val WETYPE_FONT_ASSET = "fonts/WE-Regular.ttf"
-private const val MODULE_WETYPE_FONT_ASSET = "WE-Regular.ttf"
 private const val TRANSPARENT_BOTTOM_VIEW_DARK_CONTENT = 0xFFF5F5F5.toInt()
 private const val TRANSPARENT_BOTTOM_VIEW_LIGHT_CONTENT = 0xFF202020.toInt()
 private const val TARGET_KIND_SYSTEM = "system"
@@ -222,11 +223,11 @@ class MainHook : XposedModule() {
             // 搜索/瀑布流 Hook 的状态都挂在本模块对象上、随 ClassLoader 一起换代，
             // 没有 prepareForHotReload；主线程残留回调会被各自的弱引用与代数检查挡住。
         }
-        WeTypeSettings.prepareForHotReload()
         if (!hostClean || !windowClean || !resourcesClean || !mainClean || !clipboardClean) {
             Log.e("Reject hot reload because target-process callbacks could not be fully cleaned")
             return false
         }
+        WeTypeSettings.prepareForHotReload()
         Log.i("Old generation is ready for hot reload")
         return true
     }
@@ -326,6 +327,8 @@ class MainHook : XposedModule() {
             // supplied by onPackageReady still resolves the original APK's duplicate classes.
             HookEnvironment.updateClassLoader(context.classLoader)
             WeTypeSettings.ensureHostSnapshot(context)
+            // 上游新增：亮暗外观模式感知需要在 WeType hook 前装好
+            WeTypeThemeMode.install(context.classLoader, context.applicationInfo.sourceDir)
             installWeTypeHooks(sourcePackage, sourceDir, context.classLoader)
             Log.i("Success: Hook WeType with attached application class loader")
         }
@@ -378,10 +381,14 @@ class MainHook : XposedModule() {
 
         HookEnvironment.withHookScope("wetype.activation") { hookActivationHeartbeat(sourcePackage) }
         HookEnvironment.withHookScope("wetype.font") { hookWeTypeFont() }
+        HookEnvironment.withHookScope("wetype.keyboard-symbols") {
+            WeTypeKeyboardSymbols.hook(::getModuleAssetManager)
+        }
         HookEnvironment.withHookScope("wetype.colors") { hookWeTypeTransparentColors() }
         HookEnvironment.withHookScope("wetype.overlay-underlay") { WeTypeWindowHooks.hookTransparentOverlayUnderlay() }
         HookEnvironment.withHookScope("wetype.self-draw-colors") { hookWeTypeSelfDrawKeyColors() }
         HookEnvironment.withHookScope("wetype.key-corner") { hookWeTypeKeyboardKeyCorner() }
+        HookEnvironment.withHookScope("wetype.key-smooth-corner") { WeTypeKeyboardCorners.hook() }
         HookEnvironment.withHookScope("wetype.candidate-text") { hookWeTypeCandidateSpecialTextColor() }
         HookEnvironment.withHookScope("wetype.candidate-alpha") { hookWeTypeCandidateBackgroundAlpha() }
         HookEnvironment.withHookScope("wetype.candidate-margin") { hookWeTypeCandidateBackgroundLeftMargin() }
@@ -895,7 +902,6 @@ class MainHook : XposedModule() {
     private fun hookWeTypeFont() {
         WeTypeResourceHooks.hookFont(
             fontAsset = WETYPE_FONT_ASSET,
-            moduleFontAsset = MODULE_WETYPE_FONT_ASSET,
             getModuleAssetManager = ::getModuleAssetManager
         )
     }
@@ -1157,6 +1163,13 @@ class MainHook : XposedModule() {
                 if (param.argumentCount > 1 && param[1] is Int) {
                     param[1] = Color.TRANSPARENT
                 }
+                val contentColor = resolveTransparentBottomViewContentColor()
+                if (param.argumentCount > 2 && param[2] is Int) {
+                    param[2] = contentColor
+                }
+                if (param.argumentCount > 3 && param[3] is Int) {
+                    param[3] = withAlpha(contentColor, 0x66)
+                }
             }
 
             clazz.findMethod { name == "addMiuiBottomView" }.hookAfter {
@@ -1195,9 +1208,7 @@ class MainHook : XposedModule() {
     }
 
     private fun resolveTransparentBottomViewContentColor(): Int {
-        val isDarkMode =
-            Resources.getSystem().configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK ==
-                Configuration.UI_MODE_NIGHT_YES
+        val isDarkMode = WeTypeSettings.isHostDarkMode(Resources.getSystem())
         return if (isDarkMode) TRANSPARENT_BOTTOM_VIEW_DARK_CONTENT else TRANSPARENT_BOTTOM_VIEW_LIGHT_CONTENT
     }
 
