@@ -296,8 +296,12 @@ internal object WeTypeClipboardImageHost {
             ?: throw ClassNotFoundException(PREVIEW_HOST_CLASS)
         // 3.x：返回处理是 B0 ()V；4.0.1 起 B0 变成 ()Z 且被 y0 样式刷新调用（预览页
         // 打开即触发，拦它会直接把预览页切走），返回语义挪到了 A0 ()V——返回按钮的
-        // click 回调 l$a.a(View) 直接调 A0。两级查找按名字兜底兼容新旧宿主。
-        val backMethod = pickHostMethod(baseClass, "A0", "B0") {
+        // click 回调 l$a.a(View) 直接调 A0。优先走 CLIPBOARD_PREVIEW_BACK 契约的
+        // DexKit 调用图识别（唯一调用面板管理 N 的无参 void 方法），名字 A0/B0 只做
+        // 兜底；两级都失败才放弃拦截。
+        val backMethod = runCatching {
+            WeTypeHostContracts.methodOf(HostContractId.CLIPBOARD_PREVIEW_BACK)
+        }.getOrNull() ?: pickHostMethod(baseClass, "A0", "B0") {
             it.parameterTypes.isEmpty() && it.returnType == Void.TYPE
         } ?: run {
             XLog.e("[$TAG] image preview back method missing (keyboard.l#A0/B0)")
@@ -313,7 +317,7 @@ internal object WeTypeClipboardImageHost {
                 param.result = null
             }
         }
-        XLog.i("[$TAG] hooked image preview back (keyboard.l#B0)")
+        XLog.i("[$TAG] hooked image preview back (keyboard.l#${backMethod.name})")
     }
 
     /**
