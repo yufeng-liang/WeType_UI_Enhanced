@@ -95,6 +95,9 @@ jobs:
           NOTES_FILE=".github/release-notes/${TAG}.md"
           if [ -f "$NOTES_FILE" ]; then
             TITLE="$(head -1 "$NOTES_FILE" | sed -E 's/^#+[[:space:]]*//')"
+            # 首行 H1 只作 release 标题，正文剥掉它避免页面出现两个标题
+            BODY_FILE="$RUNNER_TEMP/release-body.md"
+            tail -n +2 "$NOTES_FILE" | sed '/./,$!d' > "$BODY_FILE"
           else
             TITLE="$TAG"
           fi
@@ -102,11 +105,11 @@ jobs:
           if gh release view "$TAG" >/dev/null 2>&1; then
             # 已有 release 时只补附件；没有配套 notes 文件说明标题是手写的，不要覆盖。
             if [ -f "$NOTES_FILE" ]; then
-              gh release edit "$TAG" --title "$TITLE" --notes-file "$NOTES_FILE"
+              gh release edit "$TAG" --title "$TITLE" --notes-file "$BODY_FILE"
             fi
             gh release upload "$TAG" "$SIGNED_APK" --clobber
           elif [ -f "$NOTES_FILE" ]; then
-            gh release create "$TAG" --title "$TITLE" --notes-file "$NOTES_FILE" --latest "$SIGNED_APK"
+            gh release create "$TAG" --title "$TITLE" --notes-file "$BODY_FILE" --latest "$SIGNED_APK"
           else
             gh release create "$TAG" --title "$TITLE" --generate-notes --latest "$SIGNED_APK"
           fi
