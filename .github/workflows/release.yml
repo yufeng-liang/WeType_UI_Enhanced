@@ -1,0 +1,111 @@
+name: Release Build
+
+# 打 v* tag 或手动触发时构建 release APK：
+# 1. Gradle 读取仓库根 keystore.properties 签名，CI 上由 secrets 解码生成；
+# 2. 构建产物 WeType_UI_Enhanced-<版本>_release.apk 经 zipalign + apksigner 复签校验后
+#    上传为 artifact，tag 触发时自动创建 GitHub Release 并附 APK。
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Install SDK platform and build tools
+        run: |
+          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "ANDROID_HOME=$SDK_ROOT" >> "$GITHUB_ENV"
+          SDKMANAGER="$(find "$SDK_ROOT/cmdline-tools" -maxdepth 3 -name sdkmanager -type f 2>/dev/null | head -1)"
+          if [ -z "$SDKMANAGER" ]; then
+            echo "::error::sdkmanager not found under $SDK_ROOT/cmdline-tools"
+            exit 1
+          fi
+          echo "Using $SDKMANAGER"
+          yes | "$SDKMANAGER" --licenses >/dev/null 2>&1 || true
+          "$SDKMANAGER" --install "platform-tools" "platforms;android-37" "build-tools;37.0.0" >/dev/null
+
+      - name: Decode signing keystore
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PROPS_BASE64: ${{ secrets.ANDROID_KEYSTORE_PROPS_BASE64 }}
+        run: |
+          if [ -z "$KEYSTORE_BASE64" ] || [ -z "$KEYSTORE_PROPS_BASE64" ]; then
+            echo "::error::secrets ANDROID_KEYSTORE_BASE64 / ANDROID_KEYSTORE_PROPS_BASE64 are not set"
+            exit 1
+          fi
+          mkdir -p keystore
+          echo "$KEYSTORE_BASE64" | base64 --decode > keystore/release.jks
+          echo "$KEYSTORE_PROPS_BASE64" | base64 --decode > keystore.properties
+
+      - name: Build release APK
+        run: ./gradlew :app:assembleRelease --no-daemon --stacktrace
+
+      - name: Read version
+        id: version
+        run: |
+          VERSION_NAME=$(grep -oE 'versionName = "[^"]+"' app/build.gradle.kts | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
+          VERSION_CODE=$(grep -oE 'versionCode = [0-9]+' app/build.gradle.kts | head -1 | sed -E 's/[^0-9]//g')
+          echo "name=$VERSION_NAME" >> "$GITHUB_OUTPUT"
+          echo "code=$VERSION_CODE" >> "$GITHUB_OUTPUT"
+          echo "Detected versionName=$VERSION_NAME versionCode=$VERSION_CODE"
+
+      - name: Verify and collect signed APK
+        run: |
+          BT="$ANDROID_HOME/build-tools/37.0.0"
+          APK="app/build/outputs/apk/release/WeType_UI_Enhanced-${{ steps.version.outputs.name }}_release.apk"
+          test -f "$APK" || { echo "::error::APK not found: $APK"; ls -R app/build/outputs/apk; exit 1; }
+          "$BT/apksigner" verify --print-certs "$APK"
+          cp "$APK" "$RUNNER_TEMP/WeType_UI_Enhanced-${{ steps.version.outputs.name }}_release.apk"
+          echo "SIGNED_APK=$RUNNER_TEMP/WeType_UI_Enhanced-${{ steps.version.outputs.name }}_release.apk" >> "$GITHUB_ENV"
+
+      - name: Upload signed APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: WeType_UI_Enhanced-${{ steps.version.outputs.name }}_release
+          path: ${{ env.SIGNED_APK }}
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          NOTES_FILE=".github/release-notes/${TAG}.md"
+          if [ -f "$NOTES_FILE" ]; then
+            TITLE="$(head -1 "$NOTES_FILE" | sed -E 's/^#+[[:space:]]*//')"
+          else
+            TITLE="$TAG"
+          fi
+          echo "Publishing $TAG -> $TITLE"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            # 已有 release 时只补附件；没有配套 notes 文件说明标题是手写的，不要覆盖。
+            if [ -f "$NOTES_FILE" ]; then
+              gh release edit "$TAG" --title "$TITLE" --notes-file "$NOTES_FILE"
+            fi
+            gh release upload "$TAG" "$SIGNED_APK" --clobber
+          elif [ -f "$NOTES_FILE" ]; then
+            gh release create "$TAG" --title "$TITLE" --notes-file "$NOTES_FILE" --latest "$SIGNED_APK"
+          else
+            gh release create "$TAG" --title "$TITLE" --generate-notes --latest "$SIGNED_APK"
+          fi
