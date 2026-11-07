@@ -517,11 +517,21 @@ internal object WeTypeClipboardSearchFilter {
         var count = 0
         for (method in adapterClass.declaredMethods) {
             if (method.name != "onBindViewHolder") continue
-            if (method.parameterTypes.size != 2) continue
+            if (method.returnType != Void.TYPE) continue
+            val params = method.parameterTypes
+            val isPayload = params.size == 3 &&
+                params[1] == Int::class.javaPrimitiveType &&
+                List::class.java.isAssignableFrom(params[2])
+            if (params.size == 2 && params[1] != Int::class.javaPrimitiveType) continue
+            if (params.size != 2 && !isPayload) continue
             try {
                 method.isAccessible = true
                 method.hookAfter { param ->
                     try {
+                        if (isPayload) {
+                            val payloads = param.argumentOrNull(2) as? Collection<*>
+                            if (payloads.isNullOrEmpty()) return@hookAfter
+                        }
                         val holder = param.args.getOrNull(0) ?: return@hookAfter
                         // 图片条目渲染与搜索开关无关；搜索高亮仍受开关控制。
                         WeTypeClipboardImageEntries.onBind(holder)

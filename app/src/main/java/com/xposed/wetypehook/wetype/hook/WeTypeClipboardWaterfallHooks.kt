@@ -396,10 +396,13 @@ internal object WeTypeClipboardWaterfallHooks {
         val enabled = WeTypeSettings.isClipboardWaterfallFlowEnabledXposed()
         if (enabled) {
             enableWaterfall(rv)
-            dropItemAnimator(rv)
         } else {
             disableWaterfall(rv)
         }
+        // 与瀑布流开关无关：图片缓存补齐后 reapplyAll 会在列表可见时二次 setList，
+        // 宿主默认 change 动画会让旧图片 holder 与新文本 holder 同帧叠画
+        // （首次进入剪贴板时缩略图盖住文字）。这里统一关掉列表动画。
+        dropItemAnimator(rv)
     }
 
     private fun enableWaterfall(rv: View) {

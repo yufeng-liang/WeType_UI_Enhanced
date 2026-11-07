@@ -6,6 +6,7 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.PorterDuff
 import android.graphics.drawable.BitmapDrawable
+import android.graphics.drawable.GradientDrawable
 import android.os.Handler
 import android.os.Looper
 import android.text.Editable
@@ -2301,10 +2302,10 @@ internal object WeTypeClipboardSearchUi {
                     } catch (t: Throwable) {
                         AndroidLog.e(TAG, "set search icon failed: ${t.message}")
                     }
-                    applyHostIconTint(this, page, ids.backBtnIvId)
                     scaleType = ImageView.ScaleType.CENTER_INSIDE
                     background = resolveNativeRoundBackground(backBtn, resources)
                     applyCircularShape(this)
+                    applyHostButtonChrome(this, page, backBtn, ids.backBtnIvId)
                     val initPad = (dpToPx(resources, 32f) * 0.15f).roundToInt()
                     setPadding(initPad, initPad, initPad, initPad)
                     isClickable = true
@@ -2324,6 +2325,8 @@ internal object WeTypeClipboardSearchUi {
                     existing.background = resolveNativeRoundBackground(backBtn, resources)
                 }
                 applyCircularShape(existing)
+                // 每次挂载都重新套一次宿主动色：皮肤/深浅色切换后按钮可能已存在但配色过期。
+                (existing as? ImageView)?.let { applyHostButtonChrome(it, page, backBtn, ids.backBtnIvId) }
                 alignSearchButton(existing, bar, backBtn, backBtnId)
             }
             root.findViewWithTag<View>(TAG_SEARCH_BUTTON)?.let { btn ->
@@ -10704,10 +10707,13 @@ internal object WeTypeClipboardSearchUi {
     }
 
     /**
-     * 宿主搜索图标是固定黑矢量（actionbar_icon_dark_search），暗色下必须自行上色：
-     * 优先复制同栏返回图标的原生 tint/colorFilter，取不到再按系统深浅色回退黑白。
+     * 宿主搜索图标是固定黑矢量（actionbar_icon_dark_search），必须按宿主皮肤自行上色：
+     * 优先复制同栏返回图标的原生 tint/colorFilter，取不到再按返回按钮背景明暗选黑/白。
      */
-    private fun applyHostIconTint(icon: ImageView, page: View, backBtnIvId: Int?) {
+    private fun applyHostIconTint(icon: ImageView, page: View, backBtnIvId: Int?, backBtn: View) {
+        // 先清掉上一次皮肤留下的 tint/colorFilter，避免两者叠加后颜色不可控。
+        icon.imageTintList = null
+        icon.colorFilter = null
         try {
             val reference = backBtnIvId?.let { page.findViewById<View>(it) } as? ImageView
             if (reference != null) {
@@ -10726,11 +10732,67 @@ internal object WeTypeClipboardSearchUi {
         } catch (t: Throwable) {
             AndroidLog.e(TAG, "search icon tint copy failed: ${t.message}")
         }
-        applyThemeIconTint(icon)
+        // 返回图标取不到 tint 时不能再按系统 uiMode 猜：键盘有独立的深色皮肤，
+        // 系统浅色下会出现白圆+黑放大镜。改为按返回按钮实际底色亮度选黑白。
+        val fill = resolveBackButtonFillColor(backBtn)
+        val color = when {
+            fill == null -> resolveThemeIconColor(icon)
+            isDarkColor(fill) -> Color.WHITE
+            else -> Color.BLACK
+        }
+        icon.setColorFilter(color, PorterDuff.Mode.SRC_IN)
     }
 
-    private fun applyThemeIconTint(icon: ImageView) {
-        icon.setColorFilter(resolveThemeIconColor(icon), PorterDuff.Mode.SRC_IN)
+    /** 搜索按钮与返回按钮共用宿主圆钮：背景 drawable 是白色底，深色靠 backgroundTintList 上色。 */
+    private fun applyHostButtonChrome(button: ImageView, page: View, backBtn: View, backBtnIvId: Int?) {
+        try {
+            // 只复制 tint，不复制 drawable 实例；null 也要写回以清掉上一次皮肤留下的色。
+            button.backgroundTintList = backBtn.backgroundTintList
+            button.backgroundTintMode = backBtn.backgroundTintMode
+            if (backBtn.backgroundTintList != null) {
+                AndroidLog.i(TAG, "search button background tint copied from back_btn")
+            }
+        } catch (t: Throwable) {
+            AndroidLog.e(TAG, "search button background tint copy failed: ${t.message}")
+        }
+        applyHostIconTint(button, page, backBtnIvId, backBtn)
+    }
+
+    /** 取返回按钮当前底色：优先 backgroundTintList，其次从背景 drawable 的填充层里找。 */
+    private fun resolveBackButtonFillColor(backBtn: View): Int? {
+        backBtn.backgroundTintList?.let { tint ->
+            val color = runCatching {
+                tint.getColorForState(backBtn.drawableState, tint.defaultColor)
+            }.getOrDefault(tint.defaultColor)
+            if (Color.alpha(color) != 0) return color
+        }
+        return resolveDrawableFillColor(backBtn.background)
+    }
+
+    private fun resolveDrawableFillColor(drawable: android.graphics.drawable.Drawable?): Int? {
+        when (drawable) {
+            null -> return null
+            is GradientDrawable -> {
+                val color = runCatching { drawable.color?.defaultColor }.getOrNull()
+                if (color != null && Color.alpha(color) != 0) return color
+            }
+            is android.graphics.drawable.RippleDrawable -> {
+                for (index in 0 until drawable.numberOfLayers) {
+                    resolveDrawableFillColor(drawable.getDrawable(index))?.let { return it }
+                }
+            }
+            is android.graphics.drawable.LayerDrawable -> {
+                for (index in 0 until drawable.numberOfLayers) {
+                    resolveDrawableFillColor(drawable.getDrawable(index))?.let { return it }
+                }
+            }
+        }
+        return null
+    }
+
+    private fun isDarkColor(color: Int): Boolean {
+        val luminance = (Color.red(color) * 299 + Color.green(color) * 587 + Color.blue(color) * 114) / 1000
+        return luminance < 128
     }
 
     private fun resolveThemeIconColor(view: View): Int {

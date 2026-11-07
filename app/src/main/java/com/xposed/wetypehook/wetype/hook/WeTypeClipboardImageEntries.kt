@@ -47,6 +47,7 @@ internal object WeTypeClipboardImageEntries {
     private const val THUMB_CORNER_DP = 6
     private const val THUMB_BG_COLOR = 0x14000000
     private const val TAG_ROW_CLICK = "wetype_clipboard_image_row_click"
+    private const val TAG_THUMB = "wetype_clipboard_image_thumb"
 
     /**
      * 判断「这次点击是不是操作栏里的」时沿父链向上找的最大层数。
@@ -120,8 +121,11 @@ internal object WeTypeClipboardImageEntries {
     fun onBind(holder: Any) {
         if (!WeTypeClipboardImageHost.isReady()) return
         try {
-            val item = WeTypeClipboardImageHost.holderRecordItem(holder) ?: return
+            // 先按视图树复位模块注入的视图：holder 复用自图片行时，即使拿不到 item
+            // （宿主局部刷新/动画中间态）也必须把缩略图和点击层藏掉，否则会盖住文本。
             val itemView = getHolderItemView(holder) ?: return
+            resetInjectedRowViews(itemView, holder)
+            val item = WeTypeClipboardImageHost.holderRecordItem(holder) ?: return
             val contentTv = WeTypeClipboardImageHost.findView(itemView, WeTypeClipboardImageHost.contentTvId) as? TextView
             val contentScroll = WeTypeClipboardImageHost.findView(itemView, WeTypeClipboardImageHost.contentScrollId)
             val line1 = WeTypeClipboardImageHost.findView(itemView, WeTypeClipboardImageHost.line1Id)
@@ -135,13 +139,17 @@ internal object WeTypeClipboardImageEntries {
             WeTypeClipboardImageHost.syncActionBarForItem(itemView, type == 1L)
             if (type != 1L) {
                 boundItemByHolder.remove(holder)
-                thumbnailByHolder[holder]?.get()?.visibility = View.GONE
-                rowClickByHolder[holder]?.get()?.visibility = View.GONE
                 contentScroll?.visibility = View.VISIBLE
-                if (!WeTypeClipboardWaterfallHooks.isWaterfallEnabled()) {
-                    // 瀑布流行高由文本自身撑开，这里再把行高写回单行高就会把长文本压死。
-                    applyLineHeight(line1, line1Px)
-                }
+                // 缩略图/点击层已在开头按 tag 复位；行高也要写回：瀑布流靠文本自身撑开，
+                // 其余模式恢复宿主单行高，避免沿用图片行的两行高度。
+                applyLineHeight(
+                    line1,
+                    if (WeTypeClipboardWaterfallHooks.isWaterfallEnabled()) {
+                        ViewGroup.LayoutParams.WRAP_CONTENT
+                    } else {
+                        line1Px
+                    }
+                )
                 return
             }
             boundItemByHolder[holder] = item
@@ -198,9 +206,15 @@ internal object WeTypeClipboardImageEntries {
     private fun ensureThumbnail(holder: Any, itemView: View, line1: View?): ImageView? {
         thumbnailByHolder[holder]?.get()?.let { return it }
         val parent = line1 as? ViewGroup ?: return null
+        // 弱表可能已被回收，但视图还挂在行里：按 tag 复用，避免重复 addView。
+        (findTaggedView(parent, TAG_THUMB) as? ImageView)?.let {
+            thumbnailByHolder[holder] = WeakReference(it)
+            return it
+        }
         val context = itemView.context ?: return null
         val thumb = ImageView(context).apply {
             id = View.generateViewId()
+            tag = TAG_THUMB
             scaleType = ImageView.ScaleType.CENTER_CROP
             clipToOutline = true
             visibility = View.GONE
@@ -237,6 +251,10 @@ internal object WeTypeClipboardImageEntries {
     private fun ensureRowClickTarget(holder: Any, itemView: View, line1: View?): View? {
         rowClickByHolder[holder]?.get()?.let { return it }
         val parent = line1 as? ViewGroup ?: return null
+        findTaggedView(parent, TAG_ROW_CLICK)?.let {
+            rowClickByHolder[holder] = WeakReference(it)
+            return it
+        }
         val overlay = View(itemView.context).apply {
             tag = TAG_ROW_CLICK
             isClickable = true
@@ -434,6 +452,38 @@ internal object WeTypeClipboardImageEntries {
         }
     }
 
+    /**
+     * 按 tag 复位所有模块注入的行内视图。holder 弱表在复用/局部刷新时可能对不上，
+     * 只按 tag 清理才能保证文本行不残留上一张图片缩略图。
+     */
+    private fun resetInjectedRowViews(itemView: View, holder: Any) {
+        // 只隐藏、不移出弱表：图片行再次绑定时 ensureThumbnail 要复用同一个视图，
+        // 移除引用会重复 addView 出多个缩略图/点击层。
+        thumbnailByHolder[holder]?.get()?.visibility = View.GONE
+        rowClickByHolder[holder]?.get()?.visibility = View.GONE
+        hideTaggedViews(itemView, TAG_THUMB)
+        hideTaggedViews(itemView, TAG_ROW_CLICK)
+    }
+
+    private fun hideTaggedViews(root: View, tag: String) {
+        if (root.tag == tag) root.visibility = View.GONE
+        if (root is ViewGroup) {
+            for (index in 0 until root.childCount) {
+                hideTaggedViews(root.getChildAt(index), tag)
+            }
+        }
+    }
+
+    private fun findTaggedView(root: View, tag: String): View? {
+        if (root.tag == tag) return root
+        if (root is ViewGroup) {
+            for (index in 0 until root.childCount) {
+                findTaggedView(root.getChildAt(index), tag)?.let { return it }
+            }
+        }
+        return null
+    }
+
     // ---- 下载完成后局部刷新 ----
 
     fun refreshItem(item: Any) {
@@ -476,20 +526,38 @@ internal object WeTypeClipboardImageEntries {
         val adapterClass = resolveAdapter(classLoader)
             ?: throw ClassNotFoundException(ADAPTER_CLASS)
         var count = 0
+        var payloadCount = 0
         var current: Class<*>? = adapterClass
         while (current != null && current != Any::class.java) {
+            // 不 hook RecyclerView.Adapter 自带的默认实现：它作用于宿主进程内所有列表。
+            if (current.name.startsWith("androidx.recyclerview.widget.RecyclerView")) break
             for (method in current.declaredMethods) {
                 if (method.name != "onBindViewHolder") continue
-                if (method.parameterTypes.size != 2) continue
-                if (method.parameterTypes[1] != Int::class.javaPrimitiveType) continue
                 if (method.returnType != Void.TYPE) continue
+                val params = method.parameterTypes
                 try {
-                    method.isAccessible = true
-                    method.hookAfter { param ->
-                        val holder = param.argumentOrNull(0) ?: return@hookAfter
-                        onBind(holder)
+                    if (params.size == 2 && params[1] == Int::class.javaPrimitiveType) {
+                        method.isAccessible = true
+                        method.hookAfter { param ->
+                            val holder = param.argumentOrNull(0) ?: return@hookAfter
+                            onBind(holder)
+                        }
+                        count++
+                    } else if (params.size == 3 &&
+                        params[1] == Int::class.javaPrimitiveType &&
+                        List::class.java.isAssignableFrom(params[2])
+                    ) {
+                        // 宿主重写的 payload 绑定不会走两参重载。仅在 payload 非空时补一次，
+                        // 避免与两参路径重复；局部刷新也必须复位缩略图和行高。
+                        method.isAccessible = true
+                        method.hookAfter { param ->
+                            val payloads = param.argumentOrNull(2) as? Collection<*>
+                            if (payloads.isNullOrEmpty()) return@hookAfter
+                            val holder = param.argumentOrNull(0) ?: return@hookAfter
+                            onBind(holder)
+                        }
+                        payloadCount++
                     }
-                    count++
                 } catch (t: Throwable) {
                     AndroidLog.e(TAG, "hook adapter onBindViewHolder failed: ${t.message}")
                 }
@@ -497,7 +565,7 @@ internal object WeTypeClipboardImageEntries {
             if (count > 0) break
             current = current.superclass
         }
-        AndroidLog.i(TAG, "hooked adapter onBindViewHolder: $count overload(s)")
+        AndroidLog.i(TAG, "hooked adapter onBindViewHolder: $count + payload $payloadCount overload(s)")
     }
 
     private fun resolveAdapter(classLoader: ClassLoader?): Class<*>? =
