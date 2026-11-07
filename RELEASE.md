@@ -27,7 +27,7 @@
 
 ## release 说明约定（.github/release-notes/v<版本>.md）
 
-- 第一行 `# <标题>` 会被 CI 用作 release 标题。
+- 第一行 `# <标题>` 会被 CI 用作 release 标题，**正文自动剥掉首行**（不会在页面重复出现）；第二行起直接写 `## 小节`。
 - 结构：这版做了什么 → 与上游项目的区别 → 安装与更新。
 - **「安装与更新」首条必须加 gh-proxy 加速链接**（国内直连慢）：
   `[文件名（gh-proxy 加速）](https://gh-proxy.org/https://github.com/yufeng-liang/WeType_UI_Enhanced/releases/download/v<版本>/WeType_UI_Enhanced-v<版本>_release.apk)`
