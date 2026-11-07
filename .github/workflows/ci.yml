@@ -37,7 +37,8 @@ jobs:
           fi
           echo "Using $SDKMANAGER"
           yes | "$SDKMANAGER" --licenses >/dev/null 2>&1 || true
-          "$SDKMANAGER" --install "platform-tools" "platforms;android-37" "build-tools;37.0.0" >/dev/null
+          # 平台包从 API 37 起改为小版本命名（android-37.0），runner 预装同名平台
+          "$SDKMANAGER" --install "platform-tools" "platforms;android-37.0" "build-tools;37.0.0" >/dev/null
 
       - name: Build debug APK (no signing required)
         run: ./gradlew :app:testDebugUnitTest :app:assembleDebug --no-daemon --stacktrace
