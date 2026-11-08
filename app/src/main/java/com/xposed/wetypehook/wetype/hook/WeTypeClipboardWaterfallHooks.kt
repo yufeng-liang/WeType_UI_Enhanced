@@ -369,17 +369,35 @@ internal object WeTypeClipboardWaterfallHooks {
 
     private fun recalibrateChildren(rv: View) {
         if (rv !is ViewGroup) return
-        // 校准要用的 id 先一次列出：原先这里先 findViewById 卡片做过滤，calibrateItem 内部又要对
-        // 同一棵子树做十几次 findViewById，每轮 onLayout × 每个可见子项都在重复遍历同一棵树。
+        val state = calibrationStateFor(rv)
+        // 列宽只有列表尺寸/内边距变化时才变；一旦变化就把所有可见条目标脏。宽度没变且没有
+        // 新绑定/展开收起的普通布局轮次，下面只做几次 map 查找就返回，不再遍历整屏子树。
+        val columnWidth = ClipboardWaterfallLayoutLogic.columnWidthPx(
+            rv.width, rv.paddingLeft, rv.paddingRight, SPAN_COUNT
+        )
+        if (columnWidth > 0 && columnWidth != state.lastColumnWidth) {
+            state.lastColumnWidth = columnWidth
+            for (i in 0 until rv.childCount) {
+                rv.getChildAt(i)?.let(::markCalibrationDirty)
+            }
+        }
         val ids = calibrateViewIds()
         for (i in 0 until rv.childCount) {
             val child = rv.getChildAt(i) ?: continue
             if (child.width <= 0) continue
-            // 一次 DFS 收齐后传下去复用；映射缺 key 与 findViewById 未命中等价（id=0 也不收）。
-            val views = collectItemViews(child, ids)
-            if (views[containerId] == null) continue
+            val itemState = itemCalibrationState(child) ?: continue
+            if (!itemState.dirty) continue
+            // collectItemViews 按条目缓存：同一 ViewHolder 只有 onBind 才会换子树，
+            // 其余布局轮次直接复用上次的 id→view 映射，避免每轮重新 DFS。
+            val views = itemState.views ?: collectItemViews(child, ids).also { itemState.views = it }
+            if (views[containerId] == null) {
+                itemState.dirty = false
+                continue
+            }
             runCatching { calibrateItem(child, child.width, measured = true, collected = views) }
                 .onFailure { ModuleLog.e("$TAG: waterfall recalibrate item failed: $it") }
+            itemState.lastWidth = child.width
+            itemState.dirty = false
         }
     }
 
@@ -462,6 +480,7 @@ internal object WeTypeClipboardWaterfallHooks {
                 resetItemWidths(child)
             }
         }
+        synchronized(rvCalibrationStates) { rvCalibrationStates.remove(rv) }
         rv.setPadding(
             state?.paddingLeft ?: 0,
             state?.paddingTop ?: rv.paddingTop,
@@ -656,6 +675,9 @@ internal object WeTypeClipboardWaterfallHooks {
             markFullSpan(itemView)
             return
         }
+        // 新绑定（含复用的 ViewHolder）必须重新按实测几何校准一次：复用时条目边界常常
+        // 与上一条完全一样，OnLayoutChangeListener 不会触发，只能靠这个 dirty 标记兜底。
+        markCalibrationDirty(itemView)
         applyItemLayout(itemView)
     }
 
@@ -1354,11 +1376,55 @@ internal object WeTypeClipboardWaterfallHooks {
     private val calibratedViews: MutableSet<View> =
         Collections.synchronizedSet(Collections.newSetFromMap(WeakHashMap<View, Boolean>()))
 
+    /**
+     * 单个条目的校准状态。
+     *
+     * [dirty] = 绑定 / 列宽变化 / 展开收起之后还没按实测几何校准过；普通滚动与无关重排
+     * 不应该再触发整棵子树重算。[views] 是上一次 collectItemViews 的结果，只有重新绑定
+     * （宿主可能换掉子树）时才清空。[lastWidth]/[lastCardHeight] 是去重用的上次实测值。
+     */
+    private class ItemCalibrationState(
+        var dirty: Boolean = true,
+        var lastWidth: Int = 0,
+        var lastCardHeight: Int = -1,
+        var views: Map<Int, View>? = null
+    )
+
+    /** 单个 RecyclerView 的校准状态：只记列宽，列宽变了才把所有可见条目重新标脏。 */
+    private class RvCalibrationState(var lastColumnWidth: Int = 0)
+
+    private val itemCalibrationStates: MutableMap<View, ItemCalibrationState> =
+        Collections.synchronizedMap(WeakHashMap())
+    private val rvCalibrationStates: MutableMap<View, RvCalibrationState> =
+        Collections.synchronizedMap(WeakHashMap())
+
+    private fun calibrationStateFor(rv: View): RvCalibrationState =
+        synchronized(rvCalibrationStates) {
+            rvCalibrationStates.getOrPut(rv) { RvCalibrationState() }
+        }
+
+    private fun itemCalibrationState(view: View): ItemCalibrationState? =
+        synchronized(itemCalibrationStates) { itemCalibrationStates[view] }
+
+    /** 标记条目需要重新校准；重新绑定会换子树，缓存的 id→view 映射一并作废。 */
+    private fun markCalibrationDirty(itemView: View) {
+        synchronized(itemCalibrationStates) {
+            val state = itemCalibrationStates.getOrPut(itemView) { ItemCalibrationState() }
+            state.dirty = true
+            state.views = null
+        }
+    }
+
     private val itemLayoutListener = View.OnLayoutChangeListener { view, _, _, right, _, _, _, _, _ ->
         val width = right - view.left
         if (width <= 0) return@OnLayoutChangeListener
+        val state = itemCalibrationState(view) ?: return@OnLayoutChangeListener
+        // 只有宽度变化或绑定后首次布局才需要重算；普通滚动/重排边界没变，直接跳过。
+        if (!state.dirty && state.lastWidth == width) return@OnLayoutChangeListener
         runCatching { calibrateItem(view, width, measured = true) }
             .onFailure { ModuleLog.e("$TAG: waterfall calibrate item failed: $it") }
+        state.lastWidth = width
+        state.dirty = false
     }
 
     /** 卡片 → 它所属的条目：卡片的布局回调里要拿到条目才能校准。
@@ -1376,16 +1442,26 @@ internal object WeTypeClipboardWaterfallHooks {
      * 比 166px 的卡片高出 68px，一直卡在这个 ViewHolder 上 —— 实机就是「滑上来之后某张卡片
      * 突然变小、上下空出一大块」。所以卡片自己的布局回调也要兜一次。
      */
-    private val cardLayoutListener = View.OnLayoutChangeListener { view, _, _, _, _, _, _, _, _ ->
+    private val cardLayoutListener = View.OnLayoutChangeListener { view, _, top, _, bottom, _, _, _, _ ->
         // 值是弱引用：条目子树被宿主拆掉后这里取不到，就当没有这条记录，直接跳过
         val itemView = cardOwners[view]?.get() ?: return@OnLayoutChangeListener
         if (itemView.width <= 0 || !isWaterfallEnabled()) return@OnLayoutChangeListener
+        val state = itemCalibrationState(itemView) ?: return@OnLayoutChangeListener
+        val cardHeight = bottom - top
+        // 卡片高度没变（普通重排）不重复校准；展开/收起导致高度变化时才补一轮。
+        if (!state.dirty && state.lastCardHeight == cardHeight) return@OnLayoutChangeListener
         runCatching { calibrateItem(itemView, itemView.width, measured = true) }
             .onFailure { ModuleLog.e("$TAG: waterfall card calibrate failed: $it") }
+        state.lastCardHeight = cardHeight
+        state.dirty = false
     }
 
     private fun attachCalibration(itemView: View) {
         if (!calibratedViews.add(itemView)) return
+        // 首次挂监听时建状态；dirty 默认为 true，第一次布局必然走一轮实测校准。
+        synchronized(itemCalibrationStates) {
+            itemCalibrationStates.getOrPut(itemView) { ItemCalibrationState() }
+        }
         itemView.addOnLayoutChangeListener(itemLayoutListener)
         findItemView(itemView, containerId)?.let { card ->
             // 值包成弱引用：见 cardOwners 声明处的说明，避免 map→value→key 强环导致条目泄漏
@@ -1401,6 +1477,7 @@ internal object WeTypeClipboardWaterfallHooks {
      */
     private fun detachCalibration(itemView: View) {
         calibratedViews.remove(itemView)
+        synchronized(itemCalibrationStates) { itemCalibrationStates.remove(itemView) }
         itemView.removeOnLayoutChangeListener(itemLayoutListener)
         findItemView(itemView, containerId)?.let { card ->
             cardOwners.remove(card)

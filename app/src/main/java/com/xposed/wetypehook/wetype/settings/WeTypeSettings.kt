@@ -5,10 +5,16 @@ import android.content.SharedPreferences
 import android.content.res.Configuration
 import android.content.res.Resources
 import android.os.FileObserver
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import java.io.File
 import java.util.UUID
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
+import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 
 object WeTypeSettings {
     const val PREF_GROUP = "wetype_settings"
@@ -146,9 +152,17 @@ object WeTypeSettings {
 
     private val settingsLock = Any()
     private val snapshotDirty = AtomicBoolean(true)
+    private val saveGeneration = AtomicLong(0)
+    private var saveExecutor: ExecutorService? = null
+    private val mainHandler by lazy { Handler(Looper.getMainLooper()) }
 
     @Volatile
     private var cachedXposedProfiles: Profiles? = null
+    /** 保存请求已接受但磁盘尚未提交时，读路径优先返回这份主线程缓存。 */
+    @Volatile
+    private var pendingSaveProfiles: Profiles? = null
+    @Volatile
+    private var pendingSaveGeneration = 0L
     @Volatile
     private var hostContext: Context? = null
     @Volatile
@@ -271,6 +285,10 @@ object WeTypeSettings {
         hostContext = null
         hostDarkModeProvider = null
         cachedXposedProfiles = null
+        pendingSaveProfiles = null
+        pendingSaveGeneration = saveGeneration.incrementAndGet()
+        saveExecutor?.shutdownNow()
+        saveExecutor = null
         snapshotDirty.set(true)
     }
 
@@ -311,6 +329,10 @@ object WeTypeSettings {
         }
     }
 
+    /**
+     * 保存设置。返回值表示请求是否已被受理；真正的落盘结果通过 [onPersisted] 在主线程回调。
+     * 磁盘写入（commit）串行放到专用 IO 线程，主线程先更新缓存以让设置立即生效。
+     */
     fun save(
         context: Context,
         profiles: Profiles,
@@ -330,19 +352,49 @@ object WeTypeSettings {
             return false
         }
         ensureHostSnapshot(appContext)
-        val persisted = runCatching {
-            synchronized(settingsLock) {
-                checkNotNull(hostFile).withLock {
-                    val preferences = appContext.getSharedPreferences(PREF_GROUP, Context.MODE_PRIVATE)
-                    writeProfiles(preferences, normalized)
-                }.also { saved ->
-                    if (saved) cachedXposedProfiles = normalized
+        val generation = saveGeneration.incrementAndGet()
+        // 主线程立即更新可见缓存；即使磁盘还在排队，getter 也返回最新设置。
+        pendingSaveProfiles = normalized
+        pendingSaveGeneration = generation
+        cachedXposedProfiles = normalized
+        snapshotDirty.set(false)
+        val executor = synchronized(settingsLock) {
+            saveExecutor?.takeIf { !it.isShutdown }
+                ?: Executors.newSingleThreadExecutor { runnable ->
+                    Thread(runnable, "wetype-settings-save").apply { isDaemon = true }
+                }.also { saveExecutor = it }
+        }
+        return try {
+            executor.execute {
+                val persisted = runCatching {
+                    synchronized(settingsLock) {
+                        checkNotNull(hostFile).withLock {
+                            val preferences = appContext.getSharedPreferences(PREF_GROUP, Context.MODE_PRIVATE)
+                            writeProfiles(preferences, normalized)
+                        }
+                    }
+                }.onFailure { Log.e(TAG, "Failed to save host preferences", it) }.getOrDefault(false)
+                // 回调与缓存回滚都回主线程；旧请求被新请求覆盖时不再回调，避免重复重启输入法。
+                mainHandler.post {
+                    if (pendingSaveGeneration != generation) return@post
+                    pendingSaveProfiles = null
+                    if (!persisted) cachedXposedProfiles = null
+                    // 让下一次读取重新对齐磁盘（含其他进程的修改）。
                     snapshotDirty.set(true)
+                    onPersisted(persisted)
                 }
             }
-        }.onFailure { Log.e(TAG, "Failed to save host preferences", it) }.getOrDefault(false)
-        onPersisted(persisted)
-        return persisted
+            true
+        } catch (rejected: RejectedExecutionException) {
+            if (pendingSaveGeneration == generation) {
+                pendingSaveProfiles = null
+                cachedXposedProfiles = null
+                snapshotDirty.set(true)
+            }
+            Log.e(TAG, "Failed to queue host preferences save", rejected)
+            onPersisted(false)
+            false
+        }
     }
 
     fun getCurrentBackgroundColorXposed(context: Context): Int =
@@ -493,6 +545,8 @@ object WeTypeSettings {
         readProfilesXposed().profile(isHostDarkMode(resources))
 
     internal fun readProfilesXposed(): Profiles {
+        // 保存已受理但尚未落盘时，优先返回主线程刚更新的缓存，避免被旧文件读回覆盖。
+        pendingSaveProfiles?.let { return it }
         if (!snapshotDirty.get()) cachedXposedProfiles?.let { return it }
         return synchronized(settingsLock) {
             val file = hostFile ?: return@synchronized defaultProfiles()

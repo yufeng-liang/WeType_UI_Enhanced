@@ -14,6 +14,7 @@ import java.io.File
 import java.lang.reflect.Method
 import java.lang.reflect.Modifier
 import java.util.WeakHashMap
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 
 /**
@@ -33,10 +34,16 @@ internal object WeTypeClipboardImageList {
     private const val DAO_FACTORY_CLASS = "com.tencent.wetype.plugin.hld.dao.c"
     private const val CLIPBOARD_MGR_CLASS = "com.tencent.wetype.plugin.hld.clipboard.B"
     private const val ITEM_GET_CREATE_TIME = "c"
+    private const val REFRESH_DEBOUNCE_MS = 400L
+    private const val EXPIRY_EXTEND_MIN_INTERVAL_MS = 60_000L
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private val executor = Executors.newSingleThreadExecutor { r ->
         Thread(r, "WeTypeClipboardImageList").apply { isDaemon = true }
+    }
+    /** 模块私有副本删除串行化，避免主线程做 listFiles/delete 文件 IO。 */
+    private val imageStoreDeleteExecutor = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "WeTypeClipboardImageStoreDelete").apply { isDaemon = true }
     }
 
     @Volatile
@@ -65,9 +72,21 @@ internal object WeTypeClipboardImageList {
     private val cachedImages = ArrayList<Any>()
     private val cachedIds = HashSet<Long>()
     private val lastNativeByScrollView = WeakHashMap<Any, ArrayList<Any>>()
+    private val pendingImageStoreDeletes: MutableSet<Long> = ConcurrentHashMap.newKeySet()
+
+    /** 防抖窗口内的刷新已排队；running 表示后台刷新正在执行。 */
+    @Volatile
+    private var refreshScheduled = false
 
     @Volatile
-    private var refreshQueued = false
+    private var refreshRunning = false
+
+    @Volatile
+    private var refreshPending = false
+
+    /** 上次批量续期的时刻，避免 changed=false 时每轮都逐条 update DB。 */
+    @Volatile
+    private var lastExpiryExtendAt = 0L
 
     @Volatile
     private var injecting = false
@@ -96,7 +115,11 @@ internal object WeTypeClipboardImageList {
         daoInsertHooked = false
         daoResolveAttempts = 0
         appContext = null
-        refreshQueued = false
+        refreshScheduled = false
+        refreshRunning = false
+        refreshPending = false
+        lastExpiryExtendAt = 0L
+        pendingImageStoreDeletes.clear()
         injecting = false
         synchronized(cacheLock) {
             cachedImages.clear()
@@ -244,7 +267,15 @@ internal object WeTypeClipboardImageList {
                 continue
             }
             method.isAccessible = true
-            method.hookAfter { primeAsync() }
+            method.hookAfter { param ->
+                // 只有图片条目才需要刷新图片缓存；文本大量落库时不再触发全表扫描。
+                val inserted = param.argumentOrNull(0)
+                if (inserted != null &&
+                    runCatching { WeTypeClipboardImageHost.itemType(inserted) }.getOrDefault(0L) == 1L
+                ) {
+                    primeAsync()
+                }
+            }
             count++
         }
         if (count > 0) {
@@ -307,16 +338,41 @@ internal object WeTypeClipboardImageList {
         primeAsync()
     }
 
+    /**
+     * 400ms 防抖：一次剪贴板落库/面板打开通常伴随多条 insert，
+     * 合并成一次全表刷新，避免每条记录都跑一遍 DAO 扫描与文件枚举。
+     */
     fun primeAsync() {
-        if (refreshQueued) return
-        refreshQueued = true
+        if (refreshRunning) {
+            refreshPending = true
+            return
+        }
+        if (refreshScheduled) return
+        refreshScheduled = true
+        mainHandler.postDelayed({
+            refreshScheduled = false
+            startRefresh()
+        }, REFRESH_DEBOUNCE_MS)
+    }
+
+    private fun startRefresh() {
+        if (refreshRunning) {
+            refreshPending = true
+            return
+        }
+        refreshRunning = true
         executor.execute {
             try {
                 refreshCacheFromDao()
             } catch (t: Throwable) {
                 AndroidLog.e(TAG, "clipboard image cache refresh failed: ${t.message}")
             } finally {
-                refreshQueued = false
+                refreshRunning = false
+                if (refreshPending) {
+                    refreshPending = false
+                    // 刷新期间又有新图片落库：再走一次防抖窗口，避免漏掉。
+                    primeAsync()
+                }
             }
         }
     }
@@ -360,17 +416,19 @@ internal object WeTypeClipboardImageList {
         }
         if (changed) {
             AndroidLog.i(TAG, "clipboard image cache refreshed: ${collected.size} item(s)")
-            if (WeTypeSettings.isRemoveClipboardRetentionLimitXposed()) {
-                runCatching { extendExpiryForImages(collected) }
-                    .onFailure { AndroidLog.e(TAG, "extend image expiry failed: ${it.message}") }
-            }
             mainHandler.post {
                 autoRequestDownloads(collected)
                 reapplyAll()
             }
-        } else if (WeTypeSettings.isRemoveClipboardRetentionLimitXposed() && collected.isNotEmpty()) {
-            runCatching { extendExpiryForImages(collected) }
-                .onFailure { AndroidLog.e(TAG, "extend image expiry failed: ${it.message}") }
+        }
+        // changed=false 时不再每轮逐条 update DB；按分钟级节奏批量续期即可。
+        if (WeTypeSettings.isRemoveClipboardRetentionLimitXposed() && collected.isNotEmpty()) {
+            val now = System.currentTimeMillis()
+            if (changed || now - lastExpiryExtendAt >= EXPIRY_EXTEND_MIN_INTERVAL_MS) {
+                lastExpiryExtendAt = now
+                runCatching { extendExpiryForImages(collected) }
+                    .onFailure { AndroidLog.e(TAG, "extend image expiry failed: ${it.message}") }
+            }
         }
     }
 
@@ -641,13 +699,31 @@ internal object WeTypeClipboardImageList {
 
     fun isInjecting(): Boolean = injecting
 
-    /** 单条删除（宿主 B.y 或列表删除回调）后同步摘除缓存与模块私有副本。 */
+    /** 单条删除（宿主 B.y 或列表删除回调）后同步摘除缓存，文件删除交给 IO 线程。 */
     fun forgetById(id: Long) {
         synchronized(cacheLock) {
             cachedIds.remove(id)
             cachedImages.removeAll { WeTypeClipboardImageHost.itemId(it) == id }
         }
-        currentApplicationContext()?.let { WeTypeClipboardImageStore.delete(it, id) }
+        enqueueImageStoreDelete(id)
+    }
+
+    private fun enqueueImageStoreDelete(id: Long) {
+        if (!pendingImageStoreDeletes.add(id)) return
+        val context = currentApplicationContext()
+        if (context == null) {
+            pendingImageStoreDeletes.remove(id)
+            return
+        }
+        imageStoreDeleteExecutor.execute {
+            try {
+                WeTypeClipboardImageStore.delete(context, id)
+            } catch (t: Throwable) {
+                AndroidLog.e(TAG, "async image store delete failed id=$id: ${t.message}")
+            } finally {
+                pendingImageStoreDeletes.remove(id)
+            }
+        }
     }
 
     fun clearCache() {

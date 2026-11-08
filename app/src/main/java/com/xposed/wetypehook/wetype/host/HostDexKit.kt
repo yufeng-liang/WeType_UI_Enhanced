@@ -49,6 +49,15 @@ internal object HostDexKit {
         failedDir = null
     }
 
+    /**
+     * 后台预热：只负责在专用线程里完成 216MB 宿主包的首次解析。
+     * 真正的查询仍走 [get]，调用方可以安全地在任意线程复用同一个 bridge。
+     */
+    fun prewarm(sourceDir: String?) {
+        if (sourceDir.isNullOrEmpty()) return
+        get(sourceDir)
+    }
+
     private fun closeLocked() {
         runCatching { bridge?.close() }
         bridge = null

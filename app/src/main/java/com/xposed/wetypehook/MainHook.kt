@@ -66,6 +66,9 @@ import java.lang.ref.WeakReference
 import java.util.WeakHashMap
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
+import java.util.concurrent.Future
 import java.util.concurrent.TimeUnit
 
 private const val TAG = "miuiime"
@@ -103,6 +106,10 @@ class MainHook : XposedModule() {
         "com.xiaomi.type"
     )
     private val installedHookTokens = ConcurrentHashMap.newKeySet<String>()
+    /** 剪贴板宿主契约初始化只跑一次的专用线程；禁止占用 Application.attach 主线程。 */
+    private val clipboardBootstrapLock = Any()
+    @Volatile private var clipboardBootstrapFuture: Future<*>? = null
+    @Volatile private var clipboardBootstrapExecutor: ExecutorService? = null
     private val imeInputFramesByDecor = WeakHashMap<View, WeakReference<ViewGroup>>()
     private val miuiBottomInsetCompensations = WeakHashMap<ViewGroup, MiuiBottomInsetCompensation>()
     private val adjustedImeContentViews = WeakHashMap<ViewGroup, WeakReference<View>>()
@@ -200,6 +207,8 @@ class MainHook : XposedModule() {
 
     override fun onHotReloading(param: HotReloadingParam): Boolean {
         param.setSavedInstanceState(activeTargetsBundle())
+        // 后台剪贴板初始化可能仍在旧 ClassLoader 上跑；先收尾再清理 Hook/关闭 DexKit。
+        awaitClipboardBootstrap()
         HookEnvironment.prepareForHotReload()
         // 共享的 DexKit 解析内核绑在旧宿主 APK 路径上，热重载后整份重建
         HostDexKit.close()
@@ -327,8 +336,6 @@ class MainHook : XposedModule() {
             // supplied by onPackageReady still resolves the original APK's duplicate classes.
             HookEnvironment.updateClassLoader(context.classLoader)
             WeTypeSettings.ensureHostSnapshot(context)
-            // 上游新增：亮暗外观模式感知需要在 WeType hook 前装好
-            WeTypeThemeMode.install(context.classLoader, context.applicationInfo.sourceDir)
             installWeTypeHooks(sourcePackage, sourceDir, context.classLoader)
             Log.i("Success: Hook WeType with attached application class loader")
         }
@@ -368,13 +375,10 @@ class MainHook : XposedModule() {
 
         // 剪贴板增强按结构匹配宿主混淆成员，DexKit 扫描与句柄解析都必须用当前进程的
         // 实际宿主 ClassLoader；Tinker 热修复后它才是能解析到补丁类的那一个。
-        if (sourceDir != null && hostClassLoader != null) {
-            HookEnvironment.withHookScope("wetype.host-contract") {
-                WeTypeHostContracts.install(sourceDir, hostClassLoader)
-            }
-            HookEnvironment.withHookScope("wetype.clipboard") {
-                WeTypeClipboardHooks.install(sourceDir, hostClassLoader)
-            }
+        // 216MB 宿主包解析 + 60 条契约解析放到后台单线程，避免 Application.attach 主线程卡顿。
+        val bootstrapSourceDir = application?.applicationInfo?.sourceDir ?: sourceDir
+        if (bootstrapSourceDir != null && hostClassLoader != null) {
+            scheduleClipboardBootstrap(bootstrapSourceDir, hostClassLoader)
         } else {
             Log.e("Skip clipboard hooks: missing host sourceDir or class loader")
         }
@@ -402,6 +406,57 @@ class MainHook : XposedModule() {
         HookEnvironment.withHookScope("wetype.about-entry") { hookWeTypeAboutLogoEntry() }
         HookEnvironment.withHookScope("wetype.keyboard-logo") { WeTypeResourceHooks.hookKeyboardLogo() }
         HookEnvironment.withHookScope("wetype.toolbar-icon") { WeTypeResourceHooks.hookToolbarIconBackground() }
+    }
+
+    /**
+     * 后台串行初始化 WeTypeThemeMode / DexKit / HostContracts / ClipboardHooks。
+     * 主线程立即返回；失败只记日志，避免阻断输入法启动。
+     */
+    private fun scheduleClipboardBootstrap(sourceDir: String, hostClassLoader: ClassLoader) {
+        val executor = synchronized(clipboardBootstrapLock) {
+            clipboardBootstrapExecutor?.takeIf { !it.isShutdown }
+                ?: Executors.newSingleThreadExecutor { runnable ->
+                    Thread(runnable, "wetype-host-bootstrap").apply { isDaemon = true }
+                }.also { clipboardBootstrapExecutor = it }
+        }
+        val future = executor.submit {
+            try {
+                // 上游顺序：先装亮暗模式 provider，再解析宿主契约；同一线程内完成，
+                // 保证 Settings 的 isHostDarkMode 在首次配色读取前已可用。
+                WeTypeThemeMode.install(hostClassLoader, sourceDir)
+                HostDexKit.prewarm(sourceDir)
+                HookEnvironment.withHookScope("wetype.host-contract") {
+                    WeTypeHostContracts.install(sourceDir, hostClassLoader)
+                }
+                HookEnvironment.withHookScope("wetype.clipboard") {
+                    WeTypeClipboardHooks.install(sourceDir, hostClassLoader)
+                }
+                Log.i("Success: WeType host bootstrap ready")
+            } catch (throwable: Throwable) {
+                Log.e("Failed: WeType host bootstrap: ${throwable.message}")
+                Log.i(throwable)
+            }
+        }
+        synchronized(clipboardBootstrapLock) {
+            clipboardBootstrapFuture = future
+        }
+    }
+
+    /** 热重载前等待后台初始化收尾，避免旧 ClassLoader 的句柄在换代期间写入缓存。 */
+    private fun awaitClipboardBootstrap() {
+        val future = synchronized(clipboardBootstrapLock) { clipboardBootstrapFuture } ?: return
+        try {
+            future.get(30, TimeUnit.SECONDS)
+        } catch (throwable: Throwable) {
+            Log.e("Failed: wait WeType host bootstrap: ${throwable.message}")
+            Log.i(throwable)
+        } finally {
+            synchronized(clipboardBootstrapLock) {
+                if (clipboardBootstrapFuture === future) clipboardBootstrapFuture = null
+                clipboardBootstrapExecutor?.shutdownNow()
+                clipboardBootstrapExecutor = null
+            }
+        }
     }
 
     private fun installBaseImeHooks(forceTransparentBottomView: Boolean) {

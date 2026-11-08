@@ -8,6 +8,7 @@ import android.graphics.Canvas
 import android.graphics.Paint
 import android.graphics.Rect
 import android.graphics.RectF
+import android.graphics.Typeface
 import android.view.View
 import android.view.ViewGroup
 import android.widget.TextView
@@ -17,6 +18,7 @@ import com.xposed.wetypehook.xposed.Log
 import com.xposed.wetypehook.xposed.hookAfter
 import com.xposed.wetypehook.xposed.hookBefore
 import com.xposed.wetypehook.xposed.loadClassOrNull
+import java.lang.ref.WeakReference
 import java.lang.reflect.Field
 import java.lang.reflect.Method
 import java.lang.reflect.Modifier
@@ -32,6 +34,13 @@ internal object WeTypeKeyboardSymbols {
     private val hookedContent = mutableSetOf<Method>()
     private val inspectedDrawers = Collections.newSetFromMap(WeakHashMap<Any, Boolean>())
     private val resourceNames = WeakHashMap<Resources, MutableMap<Int, String>>()
+    // ButtonAccess/PropertyReader 的构造成本在安装期承担一次；这里再缓存按键的结构属性，
+    // 避免每个按键每帧重复反射 KeyData/getId/drawerType。
+    private data class ButtonAccessKey(val buttonType: Class<*>, val keyboard: Class<*>)
+    private val buttonAccesses = Collections.synchronizedMap(HashMap<ButtonAccessKey, ButtonAccess>())
+    private val buttonMetaCache = Collections.synchronizedMap(WeakHashMap<Any, ButtonMeta>())
+    private val textPaintStates = Collections.synchronizedMap(WeakHashMap<Paint, TextPaintState>())
+    private val textPaintScratch = ThreadLocal<ArrayList<TextPaintState>>()
 
     fun hook(getModuleAssets: () -> AssetManager) {
         runCatching {
@@ -39,7 +48,11 @@ internal object WeTypeKeyboardSymbols {
                 ?: error("Self-draw keyboard accessor unavailable")
             val buttonType = keyboard.getMethod("getActionButton").returnType
             hookPopupFontMetrics(buttonType, keyboard)
-            val access = ButtonAccess(buttonType, keyboard)
+            val access = synchronized(buttonAccesses) {
+                buttonAccesses.getOrPut(ButtonAccessKey(buttonType, keyboard)) {
+                    ButtonAccess(buttonType, keyboard)
+                }
+            }
             val drawerType = keyboard.getMethod("getButtonDrawer").returnType
             val addDrawer = drawerType.declaredMethods.single { method ->
                 method.returnType == Void.TYPE && method.parameterTypes.size == 1 &&
@@ -175,9 +188,15 @@ internal object WeTypeKeyboardSymbols {
                         }
                         val font = SfSymbols.getTypeface(assets, hostAssets = hostResources.assets)
                             ?: return@registerHook chain.proceed()
-                        val previous = paintFields.mapNotNull { field ->
+                        val previous = textPaintScratch.get()
+                            ?: ArrayList<TextPaintState>(paintFields.size).also { textPaintScratch.set(it) }
+                        previous.clear()
+                        // 复用 TextPaintState 与临时列表，避免每次按键绘制都分配闭包/对象。
+                        paintFields.forEach { field ->
                             (field.get(chain.thisObject) as? Paint)?.let { paint ->
-                                TextPaintState(paint).also {
+                                textPaintState(paint).also {
+                                    it.capture()
+                                    previous.add(it)
                                     paint.typeface = font
                                     applyNativeTextStyle(paint)
                                 }
@@ -189,6 +208,7 @@ internal object WeTypeKeyboardSymbols {
                             chain.proceed()
                         } finally {
                             previous.forEach(TextPaintState::restore)
+                            previous.clear()
                             if (previousDrawer == null) activeFontDrawer.remove()
                             else activeFontDrawer.set(previousDrawer)
                         }
@@ -211,14 +231,27 @@ internal object WeTypeKeyboardSymbols {
         paint.isFakeBoldText = false
     }
 
-    private class TextPaintState(private val paint: Paint) {
-        private val typeface = paint.typeface
-        private val letterSpacing = paint.letterSpacing
-        private val style = paint.style
-        private val strokeWidth = paint.strokeWidth
-        private val fakeBold = paint.isFakeBoldText
+    private class TextPaintState(paint: Paint) {
+        // WeakHashMap 的值不能强引用 key，否则 Paint 永远不会被回收。
+        private val paintReference = WeakReference(paint)
+        private var typeface: Typeface? = null
+        private var letterSpacing = 0f
+        private var style = Paint.Style.FILL
+        private var strokeWidth = 0f
+        private var fakeBold = false
+
+        /** 在改写 Paint 前抓取当前值；同一 Paint 复用时只需刷新字段，不再分配对象。 */
+        fun capture() {
+            val paint = paintReference.get() ?: return
+            typeface = paint.typeface
+            letterSpacing = paint.letterSpacing
+            style = paint.style
+            strokeWidth = paint.strokeWidth
+            fakeBold = paint.isFakeBoldText
+        }
 
         fun restore() {
+            val paint = paintReference.get() ?: return
             paint.typeface = typeface
             paint.letterSpacing = letterSpacing
             paint.style = style
@@ -226,6 +259,13 @@ internal object WeTypeKeyboardSymbols {
             paint.isFakeBoldText = fakeBold
         }
     }
+
+    private fun textPaintState(paint: Paint): TextPaintState =
+        synchronized(textPaintStates) {
+            textPaintStates.getOrPut(paint) { TextPaintState(paint) }
+        }
+
+    private class ButtonMeta(val keyId: String, val drawerType: String)
 
     private class ButtonAccess(val type: Class<*>, keyboard: Class<*>) {
         private val properties = propertySignatures(type)
@@ -252,6 +292,18 @@ internal object WeTypeKeyboardSymbols {
         private val mainInk = Rect()
         private val floatInk = Rect()
 
+        /** 按键结构属性按实例缓存；按键 View 被回收后由 WeakHashMap 自动释放。 */
+        private fun meta(button: Any): ButtonMeta =
+            synchronized(buttonMetaCache) {
+                buttonMetaCache.getOrPut(button) {
+                    val data = keyData.invoke(button)
+                    ButtonMeta(
+                        keyId = keyId.invoke(data) as String,
+                        drawerType = drawerType.invoke(button) as String,
+                    )
+                }
+            }
+
         private fun property(name: String, result: Class<*>): PropertyReader {
             val signature = properties[name] ?: error("Keyboard property missing: $name")
             val method = signature.getter?.let { methodName ->
@@ -277,9 +329,10 @@ internal object WeTypeKeyboardSymbols {
                     if (resourceId == 0) "" else runCatching { resources.getResourceEntryName(resourceId) }.getOrDefault("")
                 }
             }
+            val meta = meta(button)
             val appearance = resolveWeTypeKeyAppearance(
-                keyId.invoke(keyData.invoke(button)) as String,
-                drawerType.invoke(button) as String,
+                meta.keyId,
+                meta.drawerType,
                 mainText.invoke(button) as String,
                 imageName
             )
@@ -290,7 +343,7 @@ internal object WeTypeKeyboardSymbols {
 
         @Synchronized
         fun drawDotComma(canvas: Canvas, assets: AssetManager, button: Any, hostAssets: AssetManager): Boolean {
-            if (drawerType.invoke(button) != "dotComma") return false
+            if (meta(button).drawerType != "dotComma") return false
             val main = mainText.invoke(button) as String
             val hint = floatText.invoke(button) as String
             if (main !in dotCommaTexts || hint !in dotCommaTexts) return false
@@ -327,7 +380,8 @@ internal object WeTypeKeyboardSymbols {
         fun draw(canvas: Canvas, assets: AssetManager, button: Any, appearance: WeTypeKeyAppearance, hostAssets: AssetManager): Boolean {
             val rect = drawRect.invoke(button) as Rect
             if (rect.isEmpty) return false
-            val isImage = drawerType.invoke(button) == "imageType"
+            val meta = meta(button)
+            val isImage = meta.drawerType == "imageType"
             val pressed = status.invoke(button) == "press"
             val colorMethod = when {
                 isImage && pressed -> iconPressedColor
@@ -370,7 +424,7 @@ internal object WeTypeKeyboardSymbols {
             val referenceHeight = minOf(keyHeight, nominalHeight).toFloat()
             val view = parent.invoke(button) as? View ?: return referenceHeight
             if (view.javaClass.name != EMOJI_KEYBOARD) return referenceHeight
-            val id = (keyId.invoke(keyData.invoke(button)) as String).removeSuffix("_copy")
+            val id = meta(button).keyId.removeSuffix("_copy")
             if (!((id == "return" && symbol == "arrow.left") ||
                     (id == "delete" && symbol == "delete.left"))) return referenceHeight
             val scaledIconHeight = (iconHeight?.invoke(button) as? Int)?.takeIf { it > 0 }

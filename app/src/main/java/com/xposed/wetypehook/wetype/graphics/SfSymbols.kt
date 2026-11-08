@@ -12,6 +12,7 @@ import android.graphics.fonts.FontStyle
 import android.util.LruCache
 import java.util.IdentityHashMap
 import java.util.WeakHashMap
+import java.util.concurrent.ConcurrentHashMap
 
 /** SF Pro Text and SF Symbols rendering using the module's font asset. */
 internal object SfSymbols {
@@ -27,8 +28,19 @@ internal object SfSymbols {
 
     private class FontCache {
         val families = mutableMapOf<Int, FontFamily?>()
-        val typefaces = WeakHashMap<AssetManager?, MutableMap<Int, Typeface>>()
     }
+
+    /** 线程安全的 Typeface 成品缓存；命中时完全不进入锁。 */
+    private data class TypefaceKey(
+        val assets: AssetManager,
+        val hostAssets: AssetManager?,
+        val variant: Int,
+    )
+
+    private val typefaceCache = ConcurrentHashMap<TypefaceKey, Typeface>()
+
+    /** 只保护 FontFamily/Font 的构建与 WeakHashMap 访问，成品 Typeface 在锁外命中。 */
+    private val typefaceBuildLock = Any()
 
     private class GlyphRun(
         val sizePx: Float,
@@ -55,7 +67,6 @@ internal object SfSymbols {
         hostAssets: AssetManager? = null,
     ): Typeface? = getTypeface(assets, weight, TEXT_OPTICAL_SIZE, LETTER_WIDTH, hostAssets)
 
-    @Synchronized
     private fun getTypeface(
         assets: AssetManager,
         weight: Int,
@@ -65,29 +76,36 @@ internal object SfSymbols {
     ): Typeface? {
         val resolvedWeight = weight.coerceIn(1, 1000)
         val variant = opticalSize * 1_000_000 + width * 1000 + resolvedWeight
-        val cache = fontCaches.getOrPut(assets) { FontCache() }
-        val typefaces = cache.typefaces.getOrPut(hostAssets) { mutableMapOf() }
-        typefaces[variant]?.let { return it }
-        val primary = if (cache.families.containsKey(variant)) {
-            cache.families[variant]
-        } else {
-            // Share each SF font family across host fallback combinations.
-            runCatching {
-                val font = Font.Builder(assets, FONT_ASSET)
-                    .setFontVariationSettings("'wght' $resolvedWeight, 'opsz' $opticalSize, 'wdth' $width")
-                    .setWeight(resolvedWeight)
-                    .setSlant(FontStyle.FONT_SLANT_UPRIGHT)
-                    .build()
-                FontFamily.Builder(font).build()
-            }.getOrNull().also { cache.families[variant] = it }
-        } ?: return null
-        return runCatching {
-            val builder = Typeface.CustomFallbackBuilder(primary)
-                .setStyle(FontStyle(resolvedWeight, FontStyle.FONT_SLANT_UPRIGHT))
-                .setSystemFallback("sans-serif")
-            hostAssets?.let(::getHostFamily)?.let(builder::addCustomFallback)
-            builder.build()
-        }.getOrNull()?.also { typefaces[variant] = it }
+        val key = TypefaceKey(assets, hostAssets, variant)
+        // 高频路径：每键每帧只做一次 ConcurrentHashMap 查找，不再持有全局锁。
+        typefaceCache[key]?.let { return it }
+        synchronized(typefaceBuildLock) {
+            typefaceCache[key]?.let { return it }
+            val cache = fontCaches.getOrPut(assets) { FontCache() }
+            val primary = if (cache.families.containsKey(variant)) {
+                cache.families[variant]
+            } else {
+                // Share each SF font family across host fallback combinations.
+                runCatching {
+                    val font = Font.Builder(assets, FONT_ASSET)
+                        .setFontVariationSettings("'wght' $resolvedWeight, 'opsz' $opticalSize, 'wdth' $width")
+                        .setWeight(resolvedWeight)
+                        .setSlant(FontStyle.FONT_SLANT_UPRIGHT)
+                        .build()
+                    FontFamily.Builder(font).build()
+                }.getOrNull().also { cache.families[variant] = it }
+            } ?: return null
+            val built = runCatching {
+                val builder = Typeface.CustomFallbackBuilder(primary)
+                    .setStyle(FontStyle(resolvedWeight, FontStyle.FONT_SLANT_UPRIGHT))
+                    .setSystemFallback("sans-serif")
+                hostAssets?.let(::getHostFamily)?.let(builder::addCustomFallback)
+                builder.build()
+            }.getOrNull()
+            // 只缓存成功结果；失败时下次仍可重试（字体资产可能稍后可用）。
+            if (built != null) typefaceCache[key] = built
+            return built
+        }
     }
 
     private fun getHostFamily(assets: AssetManager): FontFamily? {

@@ -11,6 +11,7 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Outline
 import android.graphics.Path
+import android.graphics.RectF
 import android.net.Uri
 import android.os.Bundle
 import android.view.View
@@ -1689,34 +1690,33 @@ private fun Modifier.weTypePreviewBloom(
     val previewCornerRadii = remember(cornerRadiusPx) {
         WeTypeCornerRadii(cornerRadiusPx, cornerRadiusPx, 0f, 0f)
     }
-    // Color/intensity changes reuse the expensive shadow paths and blur filters.
-    val bloomDrawable = remember(previewContext, previewCornerRadii) {
-        WeTypeBloomStrokeDrawable(previewContext, previewCornerRadii, color, edgeHighlightIntensity / 100f)
+    val bloomCache = remember(previewContext) { PreviewBloomBitmapCache() }
+    val styleKey = remember(color, edgeHighlightIntensity, cornerRadiusPx) {
+        PreviewBloomStyleKey(color, edgeHighlightIntensity, cornerRadiusPx)
     }
-    val bloomModifier = remember(
-        bloomDrawable, color, edgeHighlightEnabled, edgeHighlightIntensity
-    ) {
+    var settledStyleKey by remember { mutableStateOf<PreviewBloomStyleKey?>(null) }
+    LaunchedEffect(styleKey) {
+        // 拖动滑块期间每个 tick 都会取消此协程；停稳 120ms 后才切换为高质量渲染。
+        delay(120)
+        settledStyleKey = styleKey
+    }
+    val highQuality = settledStyleKey == styleKey
+    return this.then(
         Modifier.drawWithCache {
             val widthPx = size.width.roundToInt()
             val heightPx = size.height.roundToInt()
             // The bloom overlay relies on clipPath + BlurMaskFilter + Path.op, which are not reliably
             // supported on Compose's hardware-accelerated recording canvas and crash the preview. Render
-            // it once into an offscreen software bitmap (which supports every operation) and blit the
-            // result, keeping the preview pixel-accurate.
+            // it into a software bitmap and blit the result. During slider drags a downsampled bitmap is
+            // reused/cached; once the value settles one full-resolution bitmap is rendered.
             val overlayBitmap = if (edgeHighlightEnabled && widthPx > 0 && heightPx > 0) {
                 runCatching {
-                    bloomDrawable.updateStyle(color, edgeHighlightIntensity / 100f)
-                    bloomDrawable.setBounds(0, 0, widthPx, heightPx)
-                    val clipPath = createWeTypeContinuousRoundedPath(
-                        width = widthPx.toFloat(),
-                        height = heightPx.toFloat(),
-                        cornerRadii = previewCornerRadii
+                    bloomCache.render(
+                        context = previewContext,
+                        radii = previewCornerRadii,
+                        key = PreviewBloomKey(color, edgeHighlightIntensity, widthPx, heightPx, cornerRadiusPx),
+                        highQuality = highQuality
                     )
-                    Bitmap.createBitmap(widthPx, heightPx, Bitmap.Config.ARGB_8888).also { bitmap ->
-                        val bitmapCanvas = Canvas(bitmap)
-                        bitmapCanvas.clipPath(clipPath)
-                        bloomDrawable.draw(bitmapCanvas)
-                    }
                 }.getOrNull()
             } else {
                 null
@@ -1726,12 +1726,98 @@ private fun Modifier.weTypePreviewBloom(
                 drawContent()
                 val bitmap = overlayBitmap ?: return@onDrawWithContent
                 drawIntoCanvas { canvas ->
-                    canvas.nativeCanvas.drawBitmap(bitmap, 0f, 0f, null)
+                    canvas.nativeCanvas.drawBitmap(
+                        bitmap,
+                        null,
+                        RectF(0f, 0f, size.width, size.height),
+                        null
+                    )
                 }
             }
         }
+    )
+}
+
+private const val PREVIEW_BLOOM_LOW_RES_SCALE = 0.35f
+private const val PREVIEW_BLOOM_LOW_RES_STEP = 10
+
+private data class PreviewBloomStyleKey(
+    val color: Int,
+    val intensity: Int,
+    val radius: Float
+)
+
+private data class PreviewBloomKey(
+    val color: Int,
+    val intensity: Int,
+    val width: Int,
+    val height: Int,
+    val radius: Float
+)
+
+/** 缓存 bloom 预览位图：低分辨率按量化强度复用，停稳后缓存一次全分辨率结果。 */
+private class PreviewBloomBitmapCache {
+    private var lowKey: PreviewBloomKey? = null
+    private var lowBitmap: Bitmap? = null
+    private var highKey: PreviewBloomKey? = null
+    private var highBitmap: Bitmap? = null
+    private var drawable: WeTypeBloomStrokeDrawable? = null
+    private var drawableRadii: WeTypeCornerRadii? = null
+
+    fun render(
+        context: Context,
+        radii: WeTypeCornerRadii,
+        key: PreviewBloomKey,
+        highQuality: Boolean
+    ): Bitmap? {
+        val scale = if (highQuality) 1f else PREVIEW_BLOOM_LOW_RES_SCALE
+        val renderKey = if (highQuality) key else key.copy(intensity = quantizeIntensity(key.intensity))
+        val cachedKey = if (highQuality) highKey else lowKey
+        val cachedBitmap = if (highQuality) highBitmap else lowBitmap
+        if (cachedKey == renderKey && cachedBitmap != null && !cachedBitmap.isRecycled) return cachedBitmap
+
+        val width = (key.width * scale).roundToInt().coerceAtLeast(1)
+        val height = (key.height * scale).roundToInt().coerceAtLeast(1)
+        val scaledRadii = WeTypeCornerRadii(
+            radii.topLeft * scale,
+            radii.topRight * scale,
+            radii.bottomRight * scale,
+            radii.bottomLeft * scale
+        )
+        val target = if (drawableRadii == scaledRadii) {
+            drawable ?: WeTypeBloomStrokeDrawable(
+                context, scaledRadii, key.color, renderKey.intensity / 100f
+            ).also {
+                drawable = it
+                drawableRadii = scaledRadii
+            }
+        } else {
+            WeTypeBloomStrokeDrawable(context, scaledRadii, key.color, renderKey.intensity / 100f).also {
+                drawable = it
+                drawableRadii = scaledRadii
+            }
+        }
+        target.updateStyle(key.color, renderKey.intensity / 100f)
+        target.setBounds(0, 0, width, height)
+        val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        val bitmapCanvas = Canvas(bitmap)
+        bitmapCanvas.clipPath(createWeTypeContinuousRoundedPath(width.toFloat(), height.toFloat(), scaledRadii))
+        target.draw(bitmapCanvas)
+        if (highQuality) {
+            highKey = renderKey
+            highBitmap = bitmap
+        } else {
+            lowKey = renderKey
+            lowBitmap = bitmap
+        }
+        return bitmap
     }
-    return this.then(bloomModifier)
+
+    private fun quantizeIntensity(value: Int): Int {
+        val clamped = value.coerceIn(0, 100)
+        return (((clamped + PREVIEW_BLOOM_LOW_RES_STEP / 2) / PREVIEW_BLOOM_LOW_RES_STEP) *
+            PREVIEW_BLOOM_LOW_RES_STEP).coerceAtMost(100)
+    }
 }
 
 private fun createPreviewContext(baseContext: Context, isDark: Boolean): Context {

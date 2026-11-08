@@ -30,7 +30,24 @@ private const val KEYBOARD_CLASS_PREFIX = "com.tencent.wetype.plugin.hld.keyboar
 
 /** Observes the floating popup's native background without changing its layout or gestures. */
 internal object WeTypeFloatingBackgrounds {
-    private data class FloatingGeometry(val bounds: Rect, val radius: Float)
+    /**
+     * 可复用的几何对象：拖动时只更新数值，避免每帧分配 Rect/FloatingGeometry。
+     * update() 返回几何是否真正变化，未变化时上层直接跳过重绘。
+     */
+    private class FloatingGeometry {
+        val bounds = Rect()
+        var radius = 0f
+
+        fun update(left: Int, top: Int, right: Int, bottom: Int, radius: Float): Boolean {
+            val changed = this.radius != radius || bounds.left != left || bounds.top != top ||
+                bounds.right != right || bounds.bottom != bottom
+            if (changed) {
+                bounds.set(left, top, right, bottom)
+                this.radius = radius
+            }
+            return changed
+        }
+    }
 
     /** 每帧复用的九宫格外框缓存：命中时跳过 setBounds/getOutline 的原生路径探测 */
     private class DrawableGeometryCache {
@@ -39,6 +56,8 @@ internal object WeTypeFloatingBackgrounds {
         var height = -1
         var localBounds: Rect? = null
         var radius = 0f
+        val geometry = FloatingGeometry()
+        var hasGeometry = false
     }
 
     private class FloatingFrame(
@@ -63,7 +82,22 @@ internal object WeTypeFloatingBackgrounds {
         val editGeometryCache = DrawableGeometryCache()
         var observer: WeakReference<ViewTreeObserver>? = null
         var preDrawListener: ViewTreeObserver.OnPreDrawListener? = null
+        var layoutListener: ViewTreeObserver.OnGlobalLayoutListener? = null
         var attachListener: View.OnAttachStateChangeListener? = null
+        /** 布局/结构变化标记：由 OnGlobalLayout 置位 */
+        var dirty = true
+        /** 已应用的几何值，用于跳过未变化的 update 与子树背景压制 */
+        val lastAppliedBounds = Rect()
+        var lastAppliedRadius = 0f
+        var hasAppliedGeometry = false
+        /** 已应用的原始 drawable，主题异步替换时强制刷新一次 */
+        var lastAppliedNormalDrawable: Drawable? = null
+        var lastAppliedEditDrawable: Drawable? = null
+        /** content 兜底几何的复用对象 */
+        val contentGeometry = FloatingGeometry()
+        var hasContentGeometry = false
+        /** edit ImageView 局部外框的复用对象 */
+        val editLocalBounds = Rect()
     }
 
     // The View's listeners own the frame; neither weak map keys nor values keep a
@@ -209,7 +243,12 @@ internal object WeTypeFloatingBackgrounds {
             frame.observer = WeakReference(observer)
             frame.preDrawListener = listener
             observer.addOnPreDrawListener(listener)
+            // 仅在全局布局/结构变化时重新压制内容背景；稳态绘制帧不再遍历子树。
+            val layoutListener = ViewTreeObserver.OnGlobalLayoutListener { frame.dirty = true }
+            frame.layoutListener = layoutListener
+            observer.addOnGlobalLayoutListener(layoutListener)
         }
+        frame.dirty = true
         updateFrameSafely(root, frame)
     }
 
@@ -239,20 +278,33 @@ internal object WeTypeFloatingBackgrounds {
         val editGeometry = editBackground?.let { drawableGeometry(it, frame.originalEditImage, frame.editGeometryCache) }
         val geometry = drawableGeometry(normalBackground, normalDrawable, frame.normalGeometryCache)
             ?: editGeometry
-            ?: contentGeometry(root, content, frame.radiusGetter) ?: return
-        update(root, geometry.bounds, geometry.radius)
+            ?: contentGeometry(root, content, frame.radiusGetter, frame) ?: return
+        val geometryChanged = !frame.hasAppliedGeometry ||
+            frame.lastAppliedRadius != geometry.radius || frame.lastAppliedBounds != geometry.bounds
+        // 主题资源异步到达时 drawable 会被整体替换，即使几何未变也要刷新一次。
+        val drawableChanged = frame.lastAppliedNormalDrawable !== normalDrawable ||
+            frame.lastAppliedEditDrawable !== frame.originalEditImage
+        // 布局/结构变化或几何真正变化时才刷新背景与子树压制；稳态绘制帧直接跳过。
+        val refreshContent = frame.dirty || geometryChanged || drawableChanged
+        if (refreshContent) {
+            update(root, geometry.bounds, geometry.radius)
+            frame.lastAppliedBounds.set(geometry.bounds)
+            frame.lastAppliedRadius = geometry.radius
+            frame.hasAppliedGeometry = true
+            frame.lastAppliedNormalDrawable = normalDrawable
+            frame.lastAppliedEditDrawable = frame.originalEditImage
+        }
         // Preserve the native edit ImageView, including its alpha animation and
         // resize hit regions; only replace its opaque image with corner strokes.
         if (editBackground != null && editGeometry != null) {
             val handles = frame.resizeHandles ?: WeTypeFloatingResizeHandlesDrawable().also {
                 frame.resizeHandles = it
             }
-            val localBounds = Rect(editGeometry.bounds).apply {
-                offset(-editBackground.left - editBackground.paddingLeft,
-                    -editBackground.top - editBackground.paddingTop)
-            }
+            frame.editLocalBounds.set(editGeometry.bounds)
+            frame.editLocalBounds.offset(-editBackground.left - editBackground.paddingLeft,
+                -editBackground.top - editBackground.paddingTop)
             val strokeWidth = 2.5f * editBackground.resources.displayMetrics.density
-            handles.updateGeometry(localBounds, editGeometry.radius, strokeWidth)
+            handles.updateGeometry(frame.editLocalBounds, editGeometry.radius, strokeWidth)
             if (editBackground.drawable !== handles) editBackground.setImageDrawable(handles)
         }
         normalBackground.drawable?.let { image ->
@@ -260,8 +312,11 @@ internal object WeTypeFloatingBackgrounds {
             normalBackground.setImageDrawable(null)
             frame.imageSuppressed = true
         }
-        suppressContentBackgrounds(content, frame)
-        restoreSnapshotAlpha(content)
+        if (refreshContent) {
+            suppressContentBackgrounds(content, frame)
+            restoreSnapshotAlpha(content)
+            frame.dirty = false
+        }
     }
 
     private fun resolveBackgroundViewIds() {
@@ -362,6 +417,7 @@ internal object WeTypeFloatingBackgrounds {
         ) {
             cache.drawable = null
             cache.localBounds = null
+            cache.hasGeometry = false
             return null
         }
         val width = image.width - image.paddingLeft - image.paddingRight
@@ -369,6 +425,7 @@ internal object WeTypeFloatingBackgrounds {
         if (width <= 0 || height <= 0) {
             cache.drawable = null
             cache.localBounds = null
+            cache.hasGeometry = false
             return null
         }
         if (cache.drawable !== drawable || cache.width != width || cache.height != height) {
@@ -378,12 +435,23 @@ internal object WeTypeFloatingBackgrounds {
             val outline = resolveNinePatchOutline(drawable, width, height)
             cache.localBounds = outline?.first
             cache.radius = outline?.second ?: 0f
+            cache.hasGeometry = false
         }
         val localBounds = cache.localBounds ?: return null
         // 拖动/移动只改变平移量，相对 image 的局部外框可跨帧复用
-        val bounds = Rect(localBounds)
-        bounds.offset(image.left + image.paddingLeft, image.top + image.paddingTop)
-        return FloatingGeometry(bounds, cache.radius)
+        val left = image.left + image.paddingLeft + localBounds.left
+        val top = image.top + image.paddingTop + localBounds.top
+        val right = left + localBounds.width()
+        val bottom = top + localBounds.height()
+        if (cache.hasGeometry && cache.geometry.bounds.left == left && cache.geometry.bounds.top == top &&
+            cache.geometry.bounds.right == right && cache.geometry.bounds.bottom == bottom &&
+            cache.geometry.radius == cache.radius
+        ) {
+            return cache.geometry
+        }
+        cache.geometry.update(left, top, right, bottom, cache.radius)
+        cache.hasGeometry = true
+        return cache.geometry
     }
 
     private fun resolveNinePatchOutline(drawable: NinePatchDrawable, width: Int, height: Int): Pair<Rect, Float>? {
@@ -405,12 +473,28 @@ internal object WeTypeFloatingBackgrounds {
         }.getOrNull()
     }
 
-    private fun contentGeometry(root: ViewGroup, content: ViewGroup, radiusGetter: Method): FloatingGeometry? {
+    private fun contentGeometry(
+        root: ViewGroup,
+        content: ViewGroup,
+        radiusGetter: Method,
+        frame: FloatingFrame,
+    ): FloatingGeometry? {
         val radius = (radiusGetter.invoke(content) as? Number)?.toFloat() ?: return null
         if (!radius.isFinite() || radius < 0f) return null
-        val bounds = Rect(content.left, content.top, content.right, content.bottom)
-        bounds.offset(-root.left, -root.top)
-        return bounds.takeUnless { it.isEmpty }?.let { FloatingGeometry(it, radius) }
+        val left = content.left - root.left
+        val top = content.top - root.top
+        val right = content.right - root.left
+        val bottom = content.bottom - root.top
+        if (left >= right || top >= bottom) return null
+        if (frame.hasContentGeometry && frame.contentGeometry.bounds.left == left &&
+            frame.contentGeometry.bounds.top == top && frame.contentGeometry.bounds.right == right &&
+            frame.contentGeometry.bounds.bottom == bottom && frame.contentGeometry.radius == radius
+        ) {
+            return frame.contentGeometry
+        }
+        frame.contentGeometry.update(left, top, right, bottom, radius)
+        frame.hasContentGeometry = true
+        return frame.contentGeometry
     }
 
     private fun setBackgroundPreservingPadding(view: View, background: Drawable?) {
@@ -436,8 +520,14 @@ internal object WeTypeFloatingBackgrounds {
                 if (observer.isAlive) observer.removeOnPreDrawListener(listener)
             }
         }
+        frame.layoutListener?.let { listener ->
+            listOfNotNull(frame.observer?.get(), currentObserver).distinct().forEach { observer ->
+                if (observer.isAlive) observer.removeOnGlobalLayoutListener(listener)
+            }
+        }
         frame.observer = null
         frame.preDrawListener = null
+        frame.layoutListener = null
     }
 
     private fun removeFrame(root: ViewGroup, frame: FloatingFrame) {

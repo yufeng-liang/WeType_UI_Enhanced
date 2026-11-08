@@ -15,6 +15,7 @@ import android.widget.HorizontalScrollView
 import android.widget.TextView
 import com.xposed.wetypehook.wetype.clipboard.ClipboardSearchEngine
 import com.xposed.wetypehook.wetype.clipboard.ClipboardSnippetLogic
+import com.xposed.wetypehook.wetype.clipboard.IndexedContent
 import com.xposed.wetypehook.wetype.host.HostContractId
 import com.xposed.wetypehook.wetype.host.WeTypeHostContracts
 import com.xposed.wetypehook.wetype.host.pickHostMethod
@@ -23,8 +24,10 @@ import com.xposed.wetypehook.xposed.hookAfter
 import java.lang.reflect.Field
 import java.lang.reflect.Method
 import java.util.Collections
+import java.util.LinkedHashMap
 import java.util.WeakHashMap
 import java.util.concurrent.Executors
+import java.util.concurrent.Future
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 
@@ -78,6 +81,18 @@ internal object WeTypeClipboardSearchFilter {
     private val snippetOriginals: MutableMap<TextView, CharSequence> =
         Collections.synchronizedMap(WeakHashMap())
 
+    /**
+     * 高亮区间缓存：全量 rebind 会对同一批 (content, keyword) 反复绑定，旧实现每行都重跑
+     * 引擎（lowercase + 拼音构建）。LinkedHashMap 访问序 + 上限 16 条，避免长期持有大文本。
+     * key 里包含完整内容与关键词，内容/关键词任一变化都会自然 miss，不存在失效问题。
+     */
+    private val highlightRangeCache = object :
+        LinkedHashMap<Pair<String, String>, List<IntRange>>(16, 0.75f, true) {
+        override fun removeEldestEntry(
+            eldest: MutableMap.MutableEntry<Pair<String, String>, List<IntRange>>
+        ): Boolean = size > 16
+    }
+
     @Volatile
     private var hooked = false
 
@@ -88,6 +103,11 @@ internal object WeTypeClipboardSearchFilter {
 
     // 版本号 guards：新关键词/新数据到达即 +1，防后台乱序回写。
     private val version = AtomicLong(0L)
+
+    // 快速连续输入时上一轮全量扫描可能还在单线程 executor 里排队/执行。保留 Future 并在新
+    // 调度时取消（不能中断线程：宿主反射调用不响应中断，靠 version 代际检查在循环里退出）。
+    @Volatile
+    private var activeFilterFuture: Future<*>? = null
 
     // 原生 setList 回放时的重入 guard：我们自己调 setList 时跳过快照与重排，避免循环。
     private val applyingFilter = AtomicBoolean(false)
@@ -153,7 +173,7 @@ internal object WeTypeClipboardSearchFilter {
             if (targets.isEmpty()) return@Runnable
             // S6：快照为空时仍走后台/回放，使空态文案能覆盖原生空标题；
             // 后台对空快照直接产出空列表，开销可忽略。
-            executor.submit { runFilterInBackground(v, kw, snapshot, targets) }
+            activeFilterFuture = executor.submit { runFilterInBackground(v, kw, snapshot, targets) }
         } catch (t: Throwable) {
             AndroidLog.e(TAG, "debounce dispatch failed: ${t.message}")
         }
@@ -203,6 +223,9 @@ internal object WeTypeClipboardSearchFilter {
                 }
                 return
             }
+            // 空关键词且当前已经是空态：没有需要恢复的过滤结果，直接返回，避免无意义地
+            // 再走一遍快照复制/后台空过滤/全量 rebind。
+            if (raw.isNullOrEmpty() && currentKeyword.isEmpty()) return
             currentKeyword = raw.orEmpty()
             scheduleLocked()
         } catch (t: Throwable) {
@@ -253,6 +276,9 @@ internal object WeTypeClipboardSearchFilter {
     private fun scheduleLocked() {
         try {
             version.incrementAndGet()
+            // 旧的排队任务直接作废；正在跑的旧任务靠 version 代际检查在搜索循环里退出。
+            activeFilterFuture?.cancel(false)
+            activeFilterFuture = null
             mainHandler.removeCallbacks(debounceTask)
             mainHandler.postDelayed(debounceTask, DEBOUNCE_MS)
         } catch (t: Throwable) {
@@ -262,6 +288,9 @@ internal object WeTypeClipboardSearchFilter {
 
     // ---- 后台搜索（禁碰 View） ----
 
+    /** 一次过滤的产物：回放的条目 + 它们对应的完整文本（只在这里读一次 getItemContent）。 */
+    private class FilterResult(val items: List<Any>, val contents: List<String>)
+
     private fun runFilterInBackground(
         v: Long,
         keyword: String,
@@ -269,41 +298,43 @@ internal object WeTypeClipboardSearchFilter {
         targets: List<Any>
     ) {
         try {
-            val filtered: List<Any> = if (keyword.isEmpty()) {
-                ArrayList(snapshot)
+            // 排队期间已经有更新的关键词/数据：直接退出，不占 executor。
+            if (v != version.get()) return
+            val result: FilterResult = if (keyword.isEmpty()) {
+                FilterResult(ArrayList(snapshot), emptyList())
             } else {
-                filterSnapshot(snapshot, keyword)
+                filterSnapshot(snapshot, keyword, v)
             }
-            // 回放出去的文本条目的完整内容：卡片里的文字被宿主截断时，要靠它找回命中。
-            val contents: List<String> = if (keyword.isEmpty()) emptyList() else filtered.mapNotNull { item ->
-                try {
-                    if (getItemType(item) == 0L) getItemContent(item) else null
-                } catch (_: Throwable) {
-                    null
-                }
-            }
-            mainHandler.post { applyResultOnMain(v, keyword, targets, filtered, contents) }
+            if (v != version.get()) return
+            mainHandler.post { applyResultOnMain(v, keyword, targets, result.items, result.contents) }
         } catch (t: Throwable) {
             AndroidLog.e(TAG, "background filter failed: ${t.message}")
         }
     }
 
-    private fun filterSnapshot(snapshot: List<Any>, keyword: String): List<Any> {
+    private fun filterSnapshot(snapshot: List<Any>, keyword: String, generation: Long): FilterResult {
         // 文本条目逐条抽 content 走引擎；非文本原样保留不参搜（S1 证据 B:988 语义）。
         // content 读不到的条目判不准→保留（宁可多留不断数据）。
-        val textContents = ArrayList<String>()
-        val textToOrig = ArrayList<Int>()
+        // 类型与内容各只读一次并缓存到数组：旧实现 filter 内读一次、回放前又 mapNotNull 读一次，
+        // 同一批条目要付两遍反射成本。
+        val types = LongArray(snapshot.size)
+        val contentsByIndex = arrayOfNulls<String>(snapshot.size)
+        val documents = ArrayList<IndexedContent>(snapshot.size)
+        val textToOrig = ArrayList<Int>(snapshot.size)
         val unknownContent = HashSet<Int>()
         for (i in snapshot.indices) {
             val item = snapshot[i]
             try {
-                if (getItemType(item) != 0L) continue
+                val type = getItemType(item)
+                types[i] = type
+                if (type != 0L) continue
                 val content = getItemContent(item)
                 if (content == null) {
                     unknownContent.add(i)
                     continue
                 }
-                textContents.add(content)
+                contentsByIndex[i] = content
+                documents.add(IndexedContent(item, content))
                 textToOrig.add(i)
             } catch (t: Throwable) {
                 AndroidLog.e(TAG, "snapshot item read failed: ${t.message}")
@@ -311,32 +342,41 @@ internal object WeTypeClipboardSearchFilter {
         }
         val matchedOrig = HashSet<Int>()
         try {
-            val hits = ClipboardSearchEngine.search(textContents, keyword, PAGE_LIMIT)
+            val hits = ClipboardSearchEngine.searchDocuments(
+                documents, keyword, PAGE_LIMIT
+            ) { generation != version.get() || Thread.currentThread().isInterrupted }
+            if (generation != version.get() || Thread.currentThread().isInterrupted) {
+                return FilterResult(emptyList(), emptyList())
+            }
             for (hit in hits) {
                 val pos = hit.index
                 if (pos in textToOrig.indices) matchedOrig.add(textToOrig[pos])
             }
         } catch (t: Throwable) {
             AndroidLog.e(TAG, "engine search failed: ${t.message}")
-            return ArrayList(snapshot)
+            val allContents = ArrayList<String>(documents.size)
+            for (i in snapshot.indices) if (types[i] == 0L) contentsByIndex[i]?.let(allContents::add)
+            return FilterResult(ArrayList(snapshot), allContents)
         }
         val out = ArrayList<Any>(snapshot.size.coerceAtMost(PAGE_LIMIT + 16))
+        val keptContents = ArrayList<String>()
         for (i in snapshot.indices) {
             val item = snapshot[i]
             try {
-                val type = getItemType(item)
+                val type = types[i]
                 if (type != 0L) {
                     // ADR-0002：搜索关键词非空时图片条目全部隐藏；其余非文本保持原样。
                     if (type != 1L) out.add(item)
                 } else if (matchedOrig.contains(i) || unknownContent.contains(i)) {
                     out.add(item)
+                    contentsByIndex[i]?.let(keptContents::add)
                 }
             } catch (t: Throwable) {
                 AndroidLog.e(TAG, "filter item failed: ${t.message}")
                 out.add(item)
             }
         }
-        return out
+        return FilterResult(out, keptContents)
     }
 
     // ---- 主线程回放（原生链路刷新） ----
@@ -533,8 +573,8 @@ internal object WeTypeClipboardSearchFilter {
                             if (payloads.isNullOrEmpty()) return@hookAfter
                         }
                         val holder = param.args.getOrNull(0) ?: return@hookAfter
-                        // 图片条目渲染与搜索开关无关；搜索高亮仍受开关控制。
-                        WeTypeClipboardImageEntries.onBind(holder)
+                        // 图片条目 onBind 已由 WeTypeClipboardHooks 的统一 dispatcher 调用；
+                        // 这里只负责搜索高亮，避免同一次绑定重复执行图片后处理。
                         if (WeTypeSettings.isClipboardSearchEnabledXposed()) {
                             applyHighlightToHolder(holder, currentKeyword)
                         }
@@ -642,8 +682,12 @@ internal object WeTypeClipboardSearchFilter {
             // 被截掉的部分时，卡片文本里压根没有它 —— 只搜卡片文本就永远标不出来。
             val source = resolveFullContent(text)
             val ranges = try {
-                val hits = ClipboardSearchEngine.search(listOf(source), keyword, 1)
-                if (hits.isEmpty()) emptyList() else hits[0].ranges
+                synchronized(highlightRangeCache) {
+                    highlightRangeCache.getOrPut(keyword to source) {
+                        val hits = ClipboardSearchEngine.search(listOf(source), keyword, 1)
+                        if (hits.isEmpty()) emptyList() else hits[0].ranges
+                    }
+                }
             } catch (t: Throwable) {
                 AndroidLog.e(TAG, "highlight search failed: ${t.message}")
                 return

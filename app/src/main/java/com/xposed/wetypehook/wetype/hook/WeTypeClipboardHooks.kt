@@ -1,7 +1,9 @@
 package com.xposed.wetypehook.wetype.hook
 
 import com.xposed.wetypehook.wetype.host.HOST_PACKAGE
+import com.xposed.wetypehook.wetype.host.HostContractId
 import com.xposed.wetypehook.wetype.host.HostDexKit
+import com.xposed.wetypehook.wetype.host.WeTypeHostContracts
 import com.xposed.wetypehook.wetype.host.pickHostField
 import com.xposed.wetypehook.wetype.host.pickHostMethod
 import com.xposed.wetypehook.wetype.settings.WeTypeSettings
@@ -38,15 +40,23 @@ internal object WeTypeClipboardHooks {
     /** 条数上限 getter 所在的包（`model.l0$d`）。 */
     private const val CLIPBOARD_LIMIT_PACKAGE = "com.tencent.wetype.plugin.hld.model"
 
+    /** 宿主剪贴板 Adapter 短名兜底（契约不可用时）。 */
+    private const val CLIPBOARD_ADAPTER_CLASS = "com.tencent.wetype.plugin.hld.clipboard.v"
+
     private var durationField: Field? = null
     private var durationInstance: Any? = null
     private var defaultDuration: Long? = null
+
+    /** 图片行 onBind dispatcher 是否已安装，避免热重载/重复 install 时叠加 hook。 */
+    @Volatile
+    private var adapterBindHooked = false
 
     /** 留存时长字段句柄绑定宿主 ClassLoader，热重载后必须丢弃再重新定位。 */
     fun prepareForHotReload() {
         durationField = null
         durationInstance = null
         defaultDuration = null
+        adapterBindHooked = false
     }
 
     fun install(sourceDir: String?, classLoader: ClassLoader) {
@@ -74,6 +84,8 @@ internal object WeTypeClipboardHooks {
             if (WeTypeClipboardImageHost.install(classLoader)) {
                 WeTypeClipboardImageLoader.install(classLoader)
                 WeTypeClipboardImageEntries.install(classLoader)
+                // 单一 dispatcher：2 参 bind + 3 参 payload 只在这里安装一次。
+                hookClipboardImageAdapterBind(classLoader)
                 WeTypeClipboardImageList.install(classLoader)
             }
         }.onFailure {
@@ -370,6 +382,73 @@ internal object WeTypeClipboardHooks {
             Log.i("[$TAG] Hooked exceedTip: ${method.declaringClass.name}#${method.name}")
         }.onFailure {
             Log.e("[$TAG] Failed to hook exceedTip: ${it.message}")
+        }
+    }
+
+    /**
+     * 剪贴板图片行的单一 onBind dispatcher。
+     *
+     * 之前 ImageEntries、SearchFilter、WaterfallHooks 各自 hook 同一个
+     * `onBindViewHolder`，其中 SearchFilter 还在回调里直接调用
+     * `WeTypeClipboardImageEntries.onBind`，导致每个普通 bind 执行两次图片行逻辑。
+     * 现在 2 参和 3 参 payload 的图片渲染入口只在这里安装；WaterfallHooks 继续保留
+     * 自己的布局后处理，SearchFilter 只保留搜索高亮。
+     */
+    private fun hookClipboardImageAdapterBind(classLoader: ClassLoader) {
+        if (adapterBindHooked) return
+        val adapterClass = runCatching {
+            WeTypeHostContracts.classOf(HostContractId.CLIPBOARD_ADAPTER)
+        }.getOrNull() ?: runCatching {
+            Class.forName(CLIPBOARD_ADAPTER_CLASS, false, classLoader)
+        }.getOrNull() ?: run {
+            Log.e("[$TAG] Failed to resolve clipboard adapter for image dispatcher")
+            return
+        }
+        var count = 0
+        var payloadCount = 0
+        var current: Class<*>? = adapterClass
+        while (current != null && current != Any::class.java) {
+            // 不 hook RecyclerView.Adapter 的默认实现，避免影响宿主进程内所有列表。
+            if (current.name.startsWith("androidx.recyclerview.widget.RecyclerView")) break
+            for (method in current.declaredMethods) {
+                if (method.name != "onBindViewHolder" || method.returnType != Void.TYPE) continue
+                val params = method.parameterTypes
+                try {
+                    when {
+                        params.size == 2 && params[1] == Int::class.javaPrimitiveType -> {
+                            method.isAccessible = true
+                            method.hookAfter { param ->
+                                val holder = param.argumentOrNull(0) ?: return@hookAfter
+                                WeTypeClipboardImageEntries.onBind(holder)
+                            }
+                            count++
+                        }
+                        params.size == 3 &&
+                            params[1] == Int::class.javaPrimitiveType &&
+                            List::class.java.isAssignableFrom(params[2]) -> {
+                            // payload 为空的 3 参调用通常同时走 2 参重载，只在非空时补一次。
+                            method.isAccessible = true
+                            method.hookAfter { param ->
+                                val payloads = param.argumentOrNull(2) as? Collection<*>
+                                if (payloads.isNullOrEmpty()) return@hookAfter
+                                val holder = param.argumentOrNull(0) ?: return@hookAfter
+                                WeTypeClipboardImageEntries.onBind(holder)
+                            }
+                            payloadCount++
+                        }
+                    }
+                } catch (t: Throwable) {
+                    Log.e("[$TAG] Failed to hook adapter onBindViewHolder: ${t.message}")
+                }
+            }
+            if (count > 0) break
+            current = current.superclass
+        }
+        if (count > 0) {
+            adapterBindHooked = true
+            Log.i("[$TAG] Hooked clipboard image adapter bind: $count + payload $payloadCount overload(s)")
+        } else {
+            Log.e("[$TAG] Failed to hook clipboard image adapter bind: no overload found")
         }
     }
 

@@ -19,13 +19,14 @@ import com.xposed.wetypehook.wetype.clipboard.ClipboardImageRowState
 import com.xposed.wetypehook.wetype.host.HostContractId
 import com.xposed.wetypehook.wetype.host.WeTypeHostContracts
 import com.xposed.wetypehook.wetype.settings.WeTypeSettings
-import com.xposed.wetypehook.xposed.hookAfter
 import com.xposed.wetypehook.xposed.hookBefore
 import java.io.File
 import java.lang.ref.WeakReference
 import java.util.Collections
 import java.util.WeakHashMap
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.roundToInt
 
 /**
@@ -39,7 +40,6 @@ internal object WeTypeClipboardImageEntries {
 
     private const val TAG = WeTypeClipboardImageHost.TAG
     private const val Z_CLASS = "com.tencent.wetype.plugin.hld.clipboard.z"
-    private const val ADAPTER_CLASS = "com.tencent.wetype.plugin.hld.clipboard.v"
     private const val RECYCLER_VIEW_CLASS = "androidx.recyclerview.widget.RecyclerView"
     private const val CONSTRAINT_LAYOUT_PARAMS_CLASS =
         "androidx.constraintlayout.widget.ConstraintLayout\$LayoutParams"
@@ -66,7 +66,25 @@ internal object WeTypeClipboardImageEntries {
     }
 
     /** 原图尺寸（outWidth/outHeight），用于按比例计算缩略图框。 */
-    private val sizeCache = LruCache<Long, IntArray>(64)
+    private val sizeCache = LruCache<Long, IntArray>(256)
+
+    private data class FileState(
+        val path: String,
+        val lastModified: Long,
+        val exists: Boolean,
+        val checkedAt: Long
+    )
+
+    /** id+path+mtime 的文件存在性缓存，避免每次 onBind 在主线程 stat 磁盘。 */
+    private val fileStateById = ConcurrentHashMap<Long, FileState>()
+    private val fileChecksInFlight: MutableSet<Long> = ConcurrentHashMap.newKeySet()
+    private val sizeRequestsInFlight: MutableSet<Long> = ConcurrentHashMap.newKeySet()
+
+    private data class BindState(val id: Long, val path: String?, val generation: Long)
+    private val bindStateByView: MutableMap<ImageView, BindState> =
+        Collections.synchronizedMap(WeakHashMap())
+    private val nextGeneration = AtomicLong(0L)
+    private const val FILE_STATE_TTL_MS = 8_000L
 
     private val thumbnailByHolder: MutableMap<Any, WeakReference<ImageView>> =
         Collections.synchronizedMap(WeakHashMap())
@@ -106,6 +124,10 @@ internal object WeTypeClipboardImageEntries {
         }
         bitmapCache.evictAll()
         sizeCache.evictAll()
+        fileStateById.clear()
+        fileChecksInFlight.clear()
+        sizeRequestsInFlight.clear()
+        bindStateByView.clear()
     }
 
     fun install(classLoader: ClassLoader) {
@@ -115,8 +137,8 @@ internal object WeTypeClipboardImageEntries {
             return
         }
         try {
-            runCatching { hookAdapterBind(classLoader) }
-                .onFailure { AndroidLog.e(TAG, "adapter bind hook failed: ${it.message}") }
+            // onBindViewHolder 的 dispatcher 由 WeTypeClipboardHooks 统一安装一次，
+            // 本对象只保留渲染入口 onBind，避免同一适配器被重复 hook。
             hookHolderClick(classLoader)
             hooked = true
             AndroidLog.i(TAG, "clipboard image entries installed")
@@ -163,10 +185,17 @@ internal object WeTypeClipboardImageEntries {
             }
             boundItemByHolder[holder] = item
             itemViewByItem[item] = WeakReference(itemView)
+            val id = WeTypeClipboardImageHost.itemId(item) ?: return
             val path = WeTypeClipboardImageHost.itemPath(item)
             val pathType = WeTypeClipboardImageHost.itemPathType(item)
             val receiveTs = WeTypeClipboardImageHost.itemReceiveTimestamp(item)
-            val fileExists = pathType == 0 && !path.isNullOrEmpty() && File(path).exists()
+            val fileExists = when {
+                pathType != 0 -> true
+                path.isNullOrEmpty() -> false
+                // 本机图片的 classify 不看文件存在性，直接按可用处理，避免主线程 stat。
+                receiveTs <= 0L -> true
+                else -> resolveFileExists(item, id, path)
+            }
             val state = ClipboardImageEntryLogic.classify(type, receiveTs, pathType, fileExists)
             // 图片行的第二行不展示分词：缩略图统一走纯图。
             keyInfo?.visibility = View.GONE
@@ -317,7 +346,13 @@ internal object WeTypeClipboardImageEntries {
     ) {
         thumb.visibility = View.VISIBLE
         val id = WeTypeClipboardImageHost.itemId(item) ?: return
-        val size = if (adjustRatio) loadImageSize(id, path) else null
+        val generation = bindGeneration(thumb, id, path)
+        val size = if (adjustRatio) sizeCache.get(id) else null
+        if (adjustRatio && size == null && !path.isNullOrEmpty() && sizeRequestsInFlight.add(id)) {
+            requestImageSize(
+                thumb, item, path, targetHeight, rowHeight, indent, adjustRatio, crop, line1, id, generation
+            )
+        }
         val boxWidth: Int
         val boxHeight: Int
         if (adjustRatio && size != null && size[1] > 0) {
@@ -380,30 +415,102 @@ internal object WeTypeClipboardImageEntries {
         thumb.setImageDrawable(null)
         if (path.isNullOrEmpty()) return
         decodeExecutor.execute {
-            val bitmap = decodeSampled(path, boxWidth, boxHeight)
+            val bitmap = decodeSampled(path, boxWidth, boxHeight, size)
             if (bitmap != null) bitmapCache.put(id, bitmap)
             mainHandler.post {
-                if (decodeTokenByView[thumb] != id) return@post
+                if (!isCurrentBind(thumb, id, generation)) return@post
                 thumb.setImageBitmap(bitmap)
             }
         }
     }
 
-    /** 原图尺寸（首读走 bounds，缓存后随取）。 */
-    private fun loadImageSize(id: Long, path: String?): IntArray? {
-        if (path.isNullOrEmpty()) return null
-        sizeCache.get(id)?.let { return it }
-        return try {
-            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-            BitmapFactory.decodeFile(path, bounds)
-            if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
-            val size = intArrayOf(bounds.outWidth, bounds.outHeight)
+    private fun bindGeneration(thumb: ImageView, id: Long, path: String?): Long {
+        val current = bindStateByView[thumb]
+        if (current != null && current.id == id && current.path == path) return current.generation
+        val generation = nextGeneration.incrementAndGet()
+        bindStateByView[thumb] = BindState(id, path, generation)
+        return generation
+    }
+
+    private fun isCurrentBind(thumb: ImageView, id: Long, generation: Long): Boolean =
+        decodeTokenByView[thumb] == id && bindStateByView[thumb]?.generation == generation
+
+    /**
+     * 尺寸探测放到 decodeExecutor：主线程只读 sizeCache，未命中先按正方形渲染，
+     * 尺寸回来后在同一 generation 下重算一次，避免 onBind 里 decodeFile。
+     */
+    private fun requestImageSize(
+        thumb: ImageView,
+        item: Any,
+        path: String?,
+        targetHeight: Int,
+        rowHeight: Int,
+        indent: Int,
+        adjustRatio: Boolean,
+        crop: Boolean,
+        line1: View?,
+        id: Long,
+        generation: Long
+    ) {
+        if (path.isNullOrEmpty()) return
+        decodeExecutor.execute {
+            val size = try {
+                val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                BitmapFactory.decodeFile(path, bounds)
+                if (bounds.outWidth > 0 && bounds.outHeight > 0) {
+                    intArrayOf(bounds.outWidth, bounds.outHeight)
+                } else {
+                    null
+                }
+            } catch (t: Throwable) {
+                AndroidLog.e(TAG, "decode thumbnail bounds failed: ${t.message}")
+                null
+            } finally {
+                sizeRequestsInFlight.remove(id)
+            }
+            if (size == null) return@execute
             sizeCache.put(id, size)
-            size
-        } catch (t: Throwable) {
-            AndroidLog.e(TAG, "decode thumbnail bounds failed: ${t.message}")
-            null
+            mainHandler.post {
+                if (!isCurrentBind(thumb, id, generation) || !thumb.isAttachedToWindow) return@post
+                showThumbnail(
+                    thumb, item, path, targetHeight, rowHeight, indent, adjustRatio, crop, line1
+                )
+            }
         }
+    }
+
+    /**
+     * 异步探测文件存在性。缓存按 id+path 命中并带 8s TTL，文件变更时用
+     * lastModified 做二次校验；探测期间先按缓存值/乐观值渲染，不阻塞 onBind。
+     */
+    private fun resolveFileExists(item: Any, id: Long, path: String): Boolean {
+        val now = System.currentTimeMillis()
+        val cached = fileStateById[id]
+        if (cached != null && cached.path == path && now - cached.checkedAt < FILE_STATE_TTL_MS) {
+            return cached.exists
+        }
+        val optimistic = cached?.exists ?: true
+        if (!fileChecksInFlight.add(id)) return optimistic
+        decodeExecutor.execute {
+            try {
+                val file = File(path)
+                val exists = file.isFile && file.length() > 0L
+                val mtime = if (exists) file.lastModified() else 0L
+                val previous = fileStateById.put(
+                    id,
+                    FileState(path, mtime, exists, System.currentTimeMillis())
+                )
+                if (previous == null || previous.path != path ||
+                    previous.exists != exists || previous.lastModified != mtime
+                ) {
+                    // 状态变化：让当前持有该 item 的行走一次局部 rebind。
+                    mainHandler.post { refreshItem(item) }
+                }
+            } finally {
+                fileChecksInFlight.remove(id)
+            }
+        }
+        return optimistic
     }
 
     /** 行的可用宽度：行宽（未布局时退化为屏宽）- 缩略图左缩进 - 右留白。 */
@@ -416,17 +523,31 @@ internal object WeTypeClipboardImageEntries {
         return (rowWidth - indent - reserve).coerceAtLeast(1)
     }
 
-    private fun decodeSampled(path: String, targetWidth: Int, targetHeight: Int): Bitmap? {
+    private fun decodeSampled(
+        path: String,
+        targetWidth: Int,
+        targetHeight: Int,
+        knownSize: IntArray? = null
+    ): Bitmap? {
         return try {
-            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-            BitmapFactory.decodeFile(path, bounds)
-            if (bounds.outWidth <= 0 || bounds.outHeight <= 0) {
-                AndroidLog.e(TAG, "decode bounds failed path=$path out=${bounds.outWidth}x${bounds.outHeight}")
-                return null
+            val outWidth: Int
+            val outHeight: Int
+            if (knownSize != null && knownSize[0] > 0 && knownSize[1] > 0) {
+                outWidth = knownSize[0]
+                outHeight = knownSize[1]
+            } else {
+                val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                BitmapFactory.decodeFile(path, bounds)
+                if (bounds.outWidth <= 0 || bounds.outHeight <= 0) {
+                    AndroidLog.e(TAG, "decode bounds failed path=$path out=${bounds.outWidth}x${bounds.outHeight}")
+                    return null
+                }
+                outWidth = bounds.outWidth
+                outHeight = bounds.outHeight
             }
             var sample = 1
-            while (bounds.outWidth / (sample * 2) >= targetWidth &&
-                bounds.outHeight / (sample * 2) >= targetHeight
+            while (outWidth / (sample * 2) >= targetWidth &&
+                outHeight / (sample * 2) >= targetHeight
             ) {
                 sample *= 2
             }
@@ -534,63 +655,6 @@ internal object WeTypeClipboardImageEntries {
     }
 
     // ---- 点击路由（禁止图片条目直接粘贴） ----
-
-    /**
-     * 缩略图渲染入口：宿主 Adapter 每次绑定行之后调用 [onBind]。
-     * 3.5.x 起签名固定为 `onBindViewHolder(ViewHolder, int)`（泛型擦除后首参是 ViewHolder），
-     * 只按形状认，不写死混淆名。
-     */
-    private fun hookAdapterBind(classLoader: ClassLoader) {
-        val adapterClass = resolveAdapter(classLoader)
-            ?: throw ClassNotFoundException(ADAPTER_CLASS)
-        var count = 0
-        var payloadCount = 0
-        var current: Class<*>? = adapterClass
-        while (current != null && current != Any::class.java) {
-            // 不 hook RecyclerView.Adapter 自带的默认实现：它作用于宿主进程内所有列表。
-            if (current.name.startsWith("androidx.recyclerview.widget.RecyclerView")) break
-            for (method in current.declaredMethods) {
-                if (method.name != "onBindViewHolder") continue
-                if (method.returnType != Void.TYPE) continue
-                val params = method.parameterTypes
-                try {
-                    if (params.size == 2 && params[1] == Int::class.javaPrimitiveType) {
-                        method.isAccessible = true
-                        method.hookAfter { param ->
-                            val holder = param.argumentOrNull(0) ?: return@hookAfter
-                            onBind(holder)
-                        }
-                        count++
-                    } else if (params.size == 3 &&
-                        params[1] == Int::class.javaPrimitiveType &&
-                        List::class.java.isAssignableFrom(params[2])
-                    ) {
-                        // 宿主重写的 payload 绑定不会走两参重载。仅在 payload 非空时补一次，
-                        // 避免与两参路径重复；局部刷新也必须复位缩略图和行高。
-                        method.isAccessible = true
-                        method.hookAfter { param ->
-                            val payloads = param.argumentOrNull(2) as? Collection<*>
-                            if (payloads.isNullOrEmpty()) return@hookAfter
-                            val holder = param.argumentOrNull(0) ?: return@hookAfter
-                            onBind(holder)
-                        }
-                        payloadCount++
-                    }
-                } catch (t: Throwable) {
-                    AndroidLog.e(TAG, "hook adapter onBindViewHolder failed: ${t.message}")
-                }
-            }
-            if (count > 0) break
-            current = current.superclass
-        }
-        AndroidLog.i(TAG, "hooked adapter onBindViewHolder: $count + payload $payloadCount overload(s)")
-    }
-
-    private fun resolveAdapter(classLoader: ClassLoader?): Class<*>? =
-        runCatching { WeTypeHostContracts.classOf(HostContractId.CLIPBOARD_ADAPTER) }.getOrNull()
-            ?: classLoader?.let {
-                runCatching { Class.forName(ADAPTER_CLASS, false, it) }.getOrNull()
-            }
 
     /**
      * 这次点击是不是落在宿主的展开操作栏里（＋常用语 / 选词 / 删除 / 确认删除）。
