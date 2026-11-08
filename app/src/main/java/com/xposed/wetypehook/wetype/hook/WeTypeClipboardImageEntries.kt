@@ -76,6 +76,12 @@ internal object WeTypeClipboardImageEntries {
         Collections.synchronizedMap(WeakHashMap())
     private val itemViewByItem: MutableMap<Any, WeakReference<View>> =
         Collections.synchronizedMap(WeakHashMap())
+    /** holder→itemView 反射结果缓存，避免每次 onBind 都遍历字段。 */
+    private val itemViewByHolder: MutableMap<Any, WeakReference<View>> =
+        Collections.synchronizedMap(WeakHashMap())
+    /** 上一次绑定的条目类型，用于判断是否需要扫描注入视图。 */
+    private val lastTypeByHolder: MutableMap<Any, Long> =
+        Collections.synchronizedMap(WeakHashMap())
     private val decodeTokenByView: MutableMap<ImageView, Long> =
         Collections.synchronizedMap(WeakHashMap())
 
@@ -94,6 +100,8 @@ internal object WeTypeClipboardImageEntries {
             rowClickByHolder.clear()
             boundItemByHolder.clear()
             itemViewByItem.clear()
+            itemViewByHolder.clear()
+            lastTypeByHolder.clear()
             decodeTokenByView.clear()
         }
         bitmapCache.evictAll()
@@ -124,7 +132,7 @@ internal object WeTypeClipboardImageEntries {
             // 先按视图树复位模块注入的视图：holder 复用自图片行时，即使拿不到 item
             // （宿主局部刷新/动画中间态）也必须把缩略图和点击层藏掉，否则会盖住文本。
             val itemView = getHolderItemView(holder) ?: return
-            resetInjectedRowViews(itemView, holder)
+            resetInjectedRowViews(itemView, holder, lastTypeByHolder[holder] == 1L)
             val item = WeTypeClipboardImageHost.holderRecordItem(holder) ?: return
             val contentTv = WeTypeClipboardImageHost.findView(itemView, WeTypeClipboardImageHost.contentTvId) as? TextView
             val contentScroll = WeTypeClipboardImageHost.findView(itemView, WeTypeClipboardImageHost.contentScrollId)
@@ -134,6 +142,7 @@ internal object WeTypeClipboardImageEntries {
             val line2Px = WeTypeClipboardImageHost.dimenToPx(WeTypeClipboardImageHost.line2HeightRes)
             if (line1Px <= 0) return
             val type = WeTypeClipboardImageHost.itemType(item)
+            lastTypeByHolder[holder] = type
             // 图片条目的展开操作栏只留「删除」：常用语 / 选词对图片无意义。条目视图会被复用，
             // 所以文本条目这一支必须写回 VISIBLE，否则文本条目也会少两颗按钮。
             WeTypeClipboardImageHost.syncActionBarForItem(itemView, type == 1L)
@@ -456,13 +465,22 @@ internal object WeTypeClipboardImageEntries {
      * 按 tag 复位所有模块注入的行内视图。holder 弱表在复用/局部刷新时可能对不上，
      * 只按 tag 清理才能保证文本行不残留上一张图片缩略图。
      */
-    private fun resetInjectedRowViews(itemView: View, holder: Any) {
+    private fun resetInjectedRowViews(itemView: View, holder: Any, previousWasImage: Boolean) {
         // 只隐藏、不移出弱表：图片行再次绑定时 ensureThumbnail 要复用同一个视图，
         // 移除引用会重复 addView 出多个缩略图/点击层。
-        thumbnailByHolder[holder]?.get()?.visibility = View.GONE
-        rowClickByHolder[holder]?.get()?.visibility = View.GONE
-        hideTaggedViews(itemView, TAG_THUMB)
-        hideTaggedViews(itemView, TAG_ROW_CLICK)
+        val thumb = thumbnailByHolder[holder]?.get()
+        val overlay = rowClickByHolder[holder]?.get()
+        if (thumb != null || overlay != null) {
+            thumb?.visibility = View.GONE
+            overlay?.visibility = View.GONE
+            if (thumb != null && overlay != null) return
+        }
+        // 文本行从未挂过图片视图时无需遍历整棵行视图树；只有 holder 上一轮是图片行
+        // 或弱表已被回收但视图可能仍在时才按 tag 兜底扫描。
+        if (previousWasImage || thumb != null || overlay != null) {
+            hideTaggedViews(itemView, TAG_THUMB)
+            hideTaggedViews(itemView, TAG_ROW_CLICK)
+        }
     }
 
     private fun hideTaggedViews(root: View, tag: String) {
@@ -639,6 +657,7 @@ internal object WeTypeClipboardImageEntries {
     }
 
     private fun getHolderItemView(holder: Any): View? {
+        itemViewByHolder[holder]?.get()?.let { return it }
         try {
             var clazz: Class<*>? = holder.javaClass
             while (clazz != null && clazz != Any::class.java) {
@@ -646,7 +665,10 @@ internal object WeTypeClipboardImageEntries {
                     if (!View::class.java.isAssignableFrom(field.type)) continue
                     field.isAccessible = true
                     val view = field.get(holder) as? View
-                    if (view != null) return view
+                    if (view != null) {
+                        itemViewByHolder[holder] = WeakReference(view)
+                        return view
+                    }
                 }
                 clazz = clazz.superclass
             }

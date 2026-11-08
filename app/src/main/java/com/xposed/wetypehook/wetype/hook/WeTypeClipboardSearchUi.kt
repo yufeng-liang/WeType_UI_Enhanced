@@ -1,5 +1,6 @@
 package com.xposed.wetypehook.wetype.hook
 
+import android.content.res.ColorStateList
 import android.content.res.Configuration
 import android.graphics.Bitmap
 import android.graphics.Canvas
@@ -54,6 +55,22 @@ import kotlin.math.roundToInt
 internal object WeTypeClipboardSearchUi {
 
     private val submitSession = ClipboardSearchSubmitSession()
+
+    /** 搜索按钮配色同步去重：宿主皮肤常在挂载后才给返回键下发圆钮背景。 */
+    private val chromeSyncScheduled: MutableMap<View, Boolean> =
+        Collections.synchronizedMap(WeakHashMap())
+    /** 按钮当前已应用的配色快照，状态未变时跳过背景克隆与图标重绘。 */
+    private val chromeStateByButton: MutableMap<View, HostButtonChrome> =
+        Collections.synchronizedMap(WeakHashMap())
+    /** 返回图标真实颜色缓存：同一返回键只渲染一次位图。 */
+    private val iconColorByBackButton: MutableMap<View, Int> =
+        Collections.synchronizedMap(WeakHashMap())
+
+    private data class HostButtonChrome(
+        val background: android.graphics.drawable.Drawable?,
+        val tint: ColorStateList?,
+        val fill: Int?,
+    )
     private var submitDeadline = 0L
     private var nativeSubmitInstalled = false
     private var nativeNavigation: java.lang.reflect.Method? = null
@@ -2305,7 +2322,7 @@ internal object WeTypeClipboardSearchUi {
                     scaleType = ImageView.ScaleType.CENTER_INSIDE
                     background = resolveNativeRoundBackground(backBtn, resources)
                     applyCircularShape(this)
-                    applyHostButtonChrome(this, page, backBtn, ids.backBtnIvId)
+                    scheduleHostButtonChrome(this, page, backBtn, ids.backBtnIvId)
                     val initPad = (dpToPx(resources, 32f) * 0.15f).roundToInt()
                     setPadding(initPad, initPad, initPad, initPad)
                     isClickable = true
@@ -2326,7 +2343,7 @@ internal object WeTypeClipboardSearchUi {
                 }
                 applyCircularShape(existing)
                 // 每次挂载都重新套一次宿主动色：皮肤/深浅色切换后按钮可能已存在但配色过期。
-                (existing as? ImageView)?.let { applyHostButtonChrome(it, page, backBtn, ids.backBtnIvId) }
+                (existing as? ImageView)?.let { scheduleHostButtonChrome(it, page, backBtn, ids.backBtnIvId) }
                 alignSearchButton(existing, bar, backBtn, backBtnId)
             }
             root.findViewWithTag<View>(TAG_SEARCH_BUTTON)?.let { btn ->
@@ -10708,54 +10725,185 @@ internal object WeTypeClipboardSearchUi {
 
     /**
      * 宿主搜索图标是固定黑矢量（actionbar_icon_dark_search），必须按宿主皮肤自行上色：
-     * 优先复制同栏返回图标的原生 tint/colorFilter，取不到再按返回按钮背景明暗选黑/白。
+     * 直接取同栏返回图标的最终渲染色，保证放大镜与返回箭头颜色一致。
      */
-    private fun applyHostIconTint(icon: ImageView, page: View, backBtnIvId: Int?, backBtn: View) {
+    private fun applyHostIconTint(icon: ImageView, page: View, backBtnIvId: Int?, backBtn: View): Boolean {
         // 先清掉上一次皮肤留下的 tint/colorFilter，避免两者叠加后颜色不可控。
         icon.imageTintList = null
         icon.colorFilter = null
-        try {
-            val reference = backBtnIvId?.let { page.findViewById<View>(it) } as? ImageView
-            if (reference != null) {
-                reference.imageTintList?.let { tint ->
-                    icon.imageTintList = tint
-                    AndroidLog.i(TAG, "search icon tint copied from back_btn_iv")
-                    return
-                }
-                reference.colorFilter?.let { filter ->
-                    @Suppress("DEPRECATION")
-                    icon.setColorFilter(filter)
-                    AndroidLog.i(TAG, "search icon colorFilter copied from back_btn_iv")
-                    return
+        val hadColor = iconColorByBackButton.containsKey(backBtn)
+        val resolved = resolveBackIconColor(backBtn, page, backBtnIvId)
+        val color = resolved ?: resolveThemeIconColor(icon)
+        icon.setColorFilter(color, PorterDuff.Mode.SRC_IN)
+        // 首次真正取到返回箭头颜色时告知调用方，让挂载后的短时同步继续到取色成功为止。
+        return !hadColor && resolved != null
+    }
+
+    /** 取返回图标最终颜色：直接渲染返回按钮整视图（含圆底与箭头），按对比色提取箭头；每个返回键只算一次。 */
+    private fun resolveBackIconColor(backBtn: View, page: View, backBtnIvId: Int?): Int? {
+        iconColorByBackButton[backBtn]?.let { return it }
+        val color = try {
+            resolveRenderedIconColor(backBtn) ?: run {
+                val reference = backBtnIvId?.let { page.findViewById<View>(it) } as? ImageView
+                    ?: findFirstImageView(backBtn)
+                if (reference == null) null else {
+                    val tint = reference.imageTintList
+                    if (tint != null) {
+                        tint.getColorForState(reference.drawableState, tint.defaultColor)
+                    } else {
+                        resolveRenderedIconColor(reference)
+                    }
                 }
             }
         } catch (t: Throwable) {
-            AndroidLog.e(TAG, "search icon tint copy failed: ${t.message}")
+            AndroidLog.e(TAG, "resolve back icon color failed: ${t.message}")
+            null
         }
-        // 返回图标取不到 tint 时不能再按系统 uiMode 猜：键盘有独立的深色皮肤，
-        // 系统浅色下会出现白圆+黑放大镜。改为按返回按钮实际底色亮度选黑白。
-        val fill = resolveBackButtonFillColor(backBtn)
-        val color = when {
-            fill == null -> resolveThemeIconColor(icon)
-            isDarkColor(fill) -> Color.WHITE
-            else -> Color.BLACK
+        if (color != null) iconColorByBackButton[backBtn] = color
+        return color
+    }
+
+    /** 在返回按钮视图树里找第一个 ImageView（宿主的返回图标可能不是已知 id）。 */
+    private fun findFirstImageView(root: View): ImageView? {
+        if (root is ImageView) return root
+        if (root is ViewGroup) {
+            for (i in 0 until root.childCount) {
+                val found = findFirstImageView(root.getChildAt(i))
+                if (found != null) return found
+            }
         }
-        icon.setColorFilter(color, PorterDuff.Mode.SRC_IN)
+        return null
+    }
+
+    /**
+     * 渲染返回按钮整视图（圆底 + 箭头 + 可能的子 View），取与主底色对比最强的颜色作为图标色。
+     * 不能只渲染 drawable：宿主返回键的 drawable 可能只是白色圆底，箭头在子 View 或 tint 上。
+     */
+    private fun resolveRenderedIconColor(view: View): Int? {
+        return try {
+            val width = view.width.takeIf { it > 0 } ?: return null
+            val height = view.height.takeIf { it > 0 } ?: return null
+            val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+            val canvas = Canvas(bitmap)
+            view.draw(canvas)
+            val counts = HashMap<Int, Int>()
+            var opaque = 0
+            for (y in 0 until height) {
+                for (x in 0 until width) {
+                    val pixel = bitmap.getPixel(x, y)
+                    if (Color.alpha(pixel) >= 160) {
+                        counts[pixel] = (counts[pixel] ?: 0) + 1
+                        opaque++
+                    }
+                }
+            }
+            bitmap.recycle()
+            if (opaque == 0) return null
+            val background = counts.maxByOrNull { it.value }?.key ?: return null
+            val br = Color.red(background)
+            val bg = Color.green(background)
+            val bb = Color.blue(background)
+            var r = 0
+            var g = 0
+            var b = 0
+            var count = 0
+            for ((pixel, amount) in counts) {
+                val dr = Color.red(pixel) - br
+                val dg = Color.green(pixel) - bg
+                val db = Color.blue(pixel) - bb
+                // 与圆底主色拉开距离的像素就是箭头/图标；抗锯齿边缘权重低也被一并平均。
+                if (dr * dr + dg * dg + db * db >= 60 * 60) {
+                    r += Color.red(pixel) * amount
+                    g += Color.green(pixel) * amount
+                    b += Color.blue(pixel) * amount
+                    count += amount
+                }
+            }
+            if (count == 0) {
+                // 圆底可能是半透明且 alpha 低于阈值，此时不透明像素本身就是箭头。
+                var ar = 0
+                var ag = 0
+                var ab = 0
+                var ac = 0
+                for ((pixel, amount) in counts) {
+                    ar += Color.red(pixel) * amount
+                    ag += Color.green(pixel) * amount
+                    ab += Color.blue(pixel) * amount
+                    ac += amount
+                }
+                if (ac == 0) null else Color.rgb(ar / ac, ag / ac, ab / ac)
+            } else {
+                Color.rgb(r / count, g / count, b / count)
+            }
+        } catch (t: Throwable) {
+            AndroidLog.e(TAG, "render back icon color failed: ${t.message}")
+            null
+        }
     }
 
     /** 搜索按钮与返回按钮共用宿主圆钮：背景 drawable 是白色底，深色靠 backgroundTintList 上色。 */
-    private fun applyHostButtonChrome(button: ImageView, page: View, backBtn: View, backBtnIvId: Int?) {
-        try {
-            // 只复制 tint，不复制 drawable 实例；null 也要写回以清掉上一次皮肤留下的色。
-            button.backgroundTintList = backBtn.backgroundTintList
-            button.backgroundTintMode = backBtn.backgroundTintMode
-            if (backBtn.backgroundTintList != null) {
-                AndroidLog.i(TAG, "search button background tint copied from back_btn")
+    private fun applyHostButtonChrome(button: ImageView, page: View, backBtn: View, backBtnIvId: Int?): Boolean {
+        val tint = backBtn.backgroundTintList
+        val fill = if (tint == null) resolveBackButtonFillColor(backBtn) else null
+        val state = HostButtonChrome(backBtn.background, tint, fill)
+        val stateChanged = chromeStateByButton[button] != state || button.background == null
+        // 宿主没下发新皮肤时跳过背景克隆，但图标取色仍要在布局完成后重试一次。
+        if (stateChanged) {
+            chromeStateByButton[button] = state
+            iconColorByBackButton.remove(backBtn)
+            try {
+                if (state.background != null) {
+                    resolveNativeRoundBackground(backBtn, button.resources)?.let { fresh ->
+                        button.background = fresh
+                        applyCircularShape(button)
+                    }
+                }
+                // 只复制 tint，不复制 drawable 实例；null 也要写回以清掉上一次皮肤留下的色。
+                button.backgroundTintList = tint
+                button.backgroundTintMode = backBtn.backgroundTintMode
+                if (tint == null && fill != null && Color.alpha(fill) != 0) {
+                    // 宿主返回键不走 tint 上色时，用实测底色兜底，避免克隆到的白底占位一直不变。
+                    button.backgroundTintList = ColorStateList.valueOf(fill)
+                }
+            } catch (t: Throwable) {
+                AndroidLog.e(TAG, "search button background tint copy failed: ${t.message}")
             }
-        } catch (t: Throwable) {
-            AndroidLog.e(TAG, "search button background tint copy failed: ${t.message}")
         }
-        applyHostIconTint(button, page, backBtnIvId, backBtn)
+        val iconResolved = applyHostIconTint(button, page, backBtnIvId, backBtn)
+        return stateChanged || iconResolved
+    }
+
+    /**
+     * 挂载后短时同步配色：宿主皮肤可能晚于按钮创建下发，但通常几帧内完成。
+     * 状态连续不变即提前结束，最多 12 次（约 1.2 秒），避免长期占用主线程。
+     */
+    private fun scheduleHostButtonChrome(button: ImageView, page: View, backBtn: View, backBtnIvId: Int?) {
+        applyHostButtonChrome(button, page, backBtn, backBtnIvId)
+        if (chromeSyncScheduled[button] == true) return
+        chromeSyncScheduled[button] = true
+        var attempt = 0
+        var stable = 0
+        val runnable = object : Runnable {
+            override fun run() {
+                if (button.parent == null) {
+                    chromeSyncScheduled.remove(button)
+                    chromeStateByButton.remove(button)
+                    return
+                }
+                attempt++
+                if (applyHostButtonChrome(button, page, backBtn, backBtnIvId)) {
+                    stable = 0
+                } else {
+                    stable++
+                }
+                if (attempt >= 12 || stable >= 3) {
+                    chromeSyncScheduled.remove(button)
+                    return
+                }
+                button.postDelayed(this, if (stable == 0) 80L else 120L)
+            }
+        }
+        button.postDelayed(runnable, 80L)
     }
 
     /** 取返回按钮当前底色：优先 backgroundTintList，其次从背景 drawable 的填充层里找。 */
@@ -10788,11 +10936,6 @@ internal object WeTypeClipboardSearchUi {
             }
         }
         return null
-    }
-
-    private fun isDarkColor(color: Int): Boolean {
-        val luminance = (Color.red(color) * 299 + Color.green(color) * 587 + Color.blue(color) * 114) / 1000
-        return luminance < 128
     }
 
     private fun resolveThemeIconColor(view: View): Int {

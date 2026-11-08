@@ -42,6 +42,10 @@ internal object WeTypeClipboardImageList {
     @Volatile
     private var installed = false
 
+    /** 图片缓存连续落盘时合并重放，避免每张图各触发一次整表 notifyDataSetChanged。 */
+    @Volatile
+    private var reapplyScheduled = false
+
     @Volatile
     private var hostClassLoader: ClassLoader? = null
 
@@ -593,8 +597,25 @@ internal object WeTypeClipboardImageList {
         }
     }
 
-    /** 图片下载落盘/DB 变更后由调用方触发一次列表重放。 */
+    /** 图片下载落盘/DB 变更后由调用方触发一次列表重放（短窗口内合并多次请求）。 */
     fun reapplyAll() {
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            scheduleReapply()
+        } else {
+            mainHandler.post { scheduleReapply() }
+        }
+    }
+
+    private fun scheduleReapply() {
+        if (reapplyScheduled) return
+        reapplyScheduled = true
+        mainHandler.postDelayed({
+            reapplyScheduled = false
+            reapplyAllNow()
+        }, 48L)
+    }
+
+    private fun reapplyAllNow() {
         if (injecting) return
         if (WeTypeClipboardSearchFilter.isReplaying()) return
         if (WeTypeClipboardSearchFilter.currentKeywordValue().isNotEmpty()) return
