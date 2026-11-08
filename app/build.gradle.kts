@@ -35,8 +35,8 @@ android {
         applicationId = "com.xposed.wetypehook"
         minSdk = 31
         targetSdk = 37
-        versionCode = 41
-        versionName = "1.29.0.1"
+        versionCode = 42
+        versionName = "1.29.0.2"
     }
 
     buildTypes {
